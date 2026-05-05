@@ -4,6 +4,7 @@ import {
   Alert,
   Modal,
   Pressable,
+  RefreshControl,
   SafeAreaView,
   ScrollView,
   StyleSheet,
@@ -11,13 +12,17 @@ import {
   TextInput,
   View
 } from 'react-native';
-import { signOut } from 'firebase/auth';
-import { auth } from '../firebase';
 import { useAuth } from '../contexts/AuthContext';
-import { MOCK_MERCHANTS } from '../mockData';
-import { getAIRebuttal, getRouteOptimization } from '../services/api';
-import { recordCheckIn, recordRepayment, subscribeToMerchants, seedMerchants } from '../services/db';
-import type { CheckInLog, Merchant, Repayment } from '../types';
+import { 
+  getTodayRoute, 
+  recordRepayment, 
+  recordAudit, 
+  recordEscalation, 
+  createUser,
+  getAIRebuttal, 
+  getRouteOptimization 
+} from '../services/api';
+import type { CheckInLog, Merchant } from '../types';
 
 type ChatMessage = { role: 'user' | 'ai'; text: string };
 
@@ -29,358 +34,401 @@ const emptyCheckIn = {
 };
 
 export function FieldOfficerApp() {
-  const { userData } = useAuth();
+  const { userData, logout } = useAuth();
   const [merchants, setMerchants] = useState<Merchant[]>([]);
+  const [refreshing, setRefreshing] = useState(false);
   const [routeOrder, setRouteOrder] = useState<string[]>([]);
   const [routeReasoning, setRouteReasoning] = useState('');
+  const [routeLoading, setRouteLoading] = useState(false);
+
   const [selectedMerchant, setSelectedMerchant] = useState<Merchant | null>(null);
+  
+  // Modals
   const [checkInVisible, setCheckInVisible] = useState(false);
   const [chatVisible, setChatVisible] = useState(false);
+  const [escalateVisible, setEscalateVisible] = useState(false);
+  const [addUserVisible, setAddUserVisible] = useState(false);
+
+  // Forms
   const [checkInForm, setCheckInForm] = useState(emptyCheckIn);
+  const [escalateReason, setEscalateReason] = useState('');
+  const [newUserForm, setNewUserForm] = useState({ name: '', phone: '', location: '' });
+  
+  // Chat
   const [chatHistory, setChatHistory] = useState<ChatMessage[]>([]);
   const [chatMessage, setChatMessage] = useState('');
   const [chatLoading, setChatLoading] = useState(false);
-  const [routeLoading, setRouteLoading] = useState(true);
-  const [isSeeding, setIsSeeding] = useState(false);
-  const [stats, setStats] = useState({ totalCollected: 0, checkInCount: 0 });
 
-  // Subscribe to live merchant data
-  useEffect(() => {
-    const unsubscribe = subscribeToMerchants((data) => {
+  const fetchData = async () => {
+    setRefreshing(true);
+    try {
+      const data = await getTodayRoute();
       setMerchants(data);
-      // If no data, try to seed with mock data
-      if (data.length === 0 && !isSeeding) {
-        setIsSeeding(true);
-        seedMerchants(MOCK_MERCHANTS).finally(() => setIsSeeding(false));
-      }
-    });
-    return () => unsubscribe();
+    } catch (error) {
+      Alert.alert('Error', 'Failed to fetch today\'s route');
+    } finally {
+      setRefreshing(false);
+    }
+  };
+
+  useEffect(() => {
+    fetchData();
   }, []);
 
-  // Subscribe to live stats
-  useEffect(() => {
-    const officerId = userData?.email ?? 'co';
-    const unsubscribe = subscribeToTodaysStats(officerId, (newStats) => {
-      setStats(newStats);
-    });
-    return () => unsubscribe();
-  }, [userData?.email]);
-
-  // Optimize route when merchants are loaded
-  useEffect(() => {
+  const optimizeRoute = async () => {
     if (merchants.length === 0) return;
-    
-    let active = true;
-    async function optimize() {
-      try {
-        const result = await getRouteOptimization(merchants);
-        if (!active) return;
-        setRouteOrder(result.prioritizedIds ?? []);
-        setRouteReasoning(result.reasoning ?? '');
-      } catch {
-        if (active) {
-          setRouteReasoning('Route intelligence is temporarily unavailable. Using default merchant order.');
-        }
-      } finally {
-        if (active) {
-          setRouteLoading(false);
-        }
-      }
+    setRouteLoading(true);
+    try {
+      const result = await getRouteOptimization(merchants);
+      setRouteOrder(result.prioritizedIds ?? []);
+      setRouteReasoning(result.reasoning ?? '');
+    } catch {
+      setRouteReasoning('Intelligence unavailable. Using default order.');
+    } finally {
+      setRouteLoading(false);
     }
+  };
 
-    optimize();
-    return () => { active = false; };
-  }, [merchants.length > 0]); // Only re-run if count changes
-
-  const orderedMerchants = useMemo(() => {
-    return [...merchants].sort((left, right) => {
-      const leftIndex = routeOrder.indexOf(left.id);
-      const rightIndex = routeOrder.indexOf(right.id);
-      if (leftIndex === -1 && rightIndex === -1) return left.name.localeCompare(right.name);
-      if (leftIndex === -1) return 1;
-      if (rightIndex === -1) return -1;
-      return leftIndex - rightIndex;
+  const groupedMerchants = useMemo(() => {
+    const sorted = [...merchants].sort((a, b) => {
+      const aIndex = routeOrder.indexOf(a.id);
+      const bIndex = routeOrder.indexOf(b.id);
+      if (aIndex !== -1 && bIndex !== -1) return aIndex - bIndex;
+      if (aIndex !== -1) return -1;
+      if (bIndex !== -1) return 1;
+      return 0;
     });
+
+    return {
+      urgent: sorted.filter(m => m.internalStatus === 'urgent'),
+      atRisk: sorted.filter(m => m.internalStatus === 'at-risk'),
+      onTrack: sorted.filter(m => m.internalStatus === 'on-track'),
+      pending: sorted.filter(m => m.status === 'pending')
+    };
   }, [merchants, routeOrder]);
 
-  const officerName = userData?.firstName ? `${userData.firstName} ${userData.lastName ?? ''}`.trim() : 'Field Officer';
-  
-  // Note: Local aggregate stats will be simpler now, or we could fetch them from Firestore too.
-  // For now, let's keep it simple.
-
-  const handleRepayment = async (merchantId: string) => {
-    const merchant = merchants.find((entry) => entry.id === merchantId);
-    if (!merchant) return;
-
+  const handleRepayment = async (merchant: Merchant) => {
+    if (merchant.balance <= 0) {
+      Alert.alert('No balance', 'This merchant has no outstanding balance.');
+      return;
+    }
     const amount = merchant.dailyInstallment;
-    
     try {
       await recordRepayment({
-        merchantId,
+        userId: merchant.id,
         amount,
         method: 'cash',
-        officerId: userData?.email ?? 'co'
+        officerId: userData?.id ?? 'co'
       });
-      Alert.alert('Repayment recorded', `${merchant.name} paid NGN ${amount.toLocaleString()}.`);
+      Alert.alert('Success', `Recorded payment of NGN ${amount.toLocaleString()}`);
+      fetchData();
     } catch (error) {
-      Alert.alert('Error', 'Failed to record repayment. Please check your connection.');
+      Alert.alert('Error', 'Failed to record payment');
     }
   };
 
   const handleCheckInSubmit = async () => {
     if (!selectedMerchant) return;
-
     try {
-      await recordCheckIn({
-        merchantId: selectedMerchant.id,
+      await recordAudit({
+        userId: selectedMerchant.id,
         ...checkInForm
       });
-      setCheckInForm(emptyCheckIn);
       setCheckInVisible(false);
-      Alert.alert('Check-in saved', 'Soft signals recorded for this merchant.');
+      setCheckInForm(emptyCheckIn);
+      Alert.alert('Success', 'Audit recorded');
     } catch (error) {
-      Alert.alert('Error', 'Failed to save check-in.');
+      Alert.alert('Error', 'Failed to record audit');
+    }
+  };
+
+  const handleEscalateSubmit = async () => {
+    if (!selectedMerchant || !escalateReason) return;
+    try {
+      await recordEscalation({
+        userId: selectedMerchant.id,
+        reason: escalateReason
+      });
+      setEscalateVisible(false);
+      setEscalateReason('');
+      Alert.alert('Escalated', 'Risk flag sent to admin');
+    } catch (error) {
+      Alert.alert('Error', 'Failed to escalate');
+    }
+  };
+
+  const handleAddUserSubmit = async () => {
+    if (!newUserForm.name || !newUserForm.location) return;
+    try {
+      await createUser(newUserForm);
+      setAddUserVisible(false);
+      setNewUserForm({ name: '', phone: '', location: '' });
+      Alert.alert('Success', 'New borrower added as pending');
+      fetchData();
+    } catch (error) {
+      Alert.alert('Error', 'Failed to add borrower');
     }
   };
 
   const handleChat = async () => {
-    if (!chatMessage.trim() || !selectedMerchant) {
-      return;
-    }
-
-    const message = chatMessage.trim();
-    setChatHistory((current) => [...current, { role: 'user', text: message }]);
+    if (!chatMessage.trim() || !selectedMerchant) return;
+    const msg = chatMessage.trim();
+    setChatHistory(curr => [...curr, { role: 'user', text: msg }]);
     setChatMessage('');
     setChatLoading(true);
-
     try {
-      const reply = await getAIRebuttal(selectedMerchant.name, message);
-      setChatHistory((current) => [...current, { role: 'ai', text: reply }]);
+      const reply = await getAIRebuttal(selectedMerchant.name, msg);
+      setChatHistory(curr => [...curr, { role: 'ai', text: reply }]);
     } catch {
-      setChatHistory((current) => [
-        ...current,
-        { role: 'ai', text: 'Network issue while contacting Rill Intelligence.' }
-      ]);
+      setChatHistory(curr => [...curr, { role: 'ai', text: 'Intelligence link broken.' }]);
     } finally {
       setChatLoading(false);
     }
   };
 
+  const renderMerchantCard = (merchant: Merchant) => {
+    const isSelected = selectedMerchant?.id === merchant.id;
+    return (
+      <Pressable
+        key={merchant.id}
+        style={[styles.merchantCard, isSelected && styles.selectedMerchantCard]}
+        onPress={() => setSelectedMerchant(merchant)}
+      >
+        <View style={styles.merchantHeader}>
+          <View style={styles.merchantMain}>
+            <Text style={styles.merchantName}>{merchant.name}</Text>
+            <Text style={styles.merchantMeta}>{merchant.location}</Text>
+          </View>
+          <View style={[styles.statusPill, statusStyles[merchant.internalStatus || 'on-track']]}>
+            <Text style={[styles.statusText, statusTextStyles[merchant.internalStatus || 'on-track']]}>
+              {merchant.status === 'pending' ? 'PENDING' : merchant.internalStatus}
+            </Text>
+          </View>
+        </View>
+
+        <View style={styles.merchantStats}>
+          <View>
+            <Text style={styles.statLabel}>Owed</Text>
+            <Text style={styles.balanceValue}>N{merchant.balance.toLocaleString()}</Text>
+          </View>
+          <View>
+            <Text style={styles.statLabel}>Daily</Text>
+            <Text style={styles.balanceValue}>N{merchant.dailyInstallment.toLocaleString()}</Text>
+          </View>
+          <View>
+            <Text style={styles.statLabel}>Last</Text>
+            <Text style={styles.balanceValue}>{merchant.lastPaymentDate || 'Never'}</Text>
+          </View>
+        </View>
+
+        {isSelected && (
+          <View style={styles.actionsRow}>
+            <Pressable style={styles.primaryButton} onPress={() => handleRepayment(merchant)}>
+              <Text style={styles.primaryButtonText}>Log Payment</Text>
+            </Pressable>
+            <Pressable style={styles.actionButton} onPress={() => setCheckInVisible(true)}>
+              <Text style={styles.actionButtonText}>Audit</Text>
+            </Pressable>
+            <Pressable style={styles.actionButton} onPress={() => setEscalateVisible(true)}>
+              <Text style={styles.escalateText}>Escalate</Text>
+            </Pressable>
+            <Pressable style={styles.actionButton} onPress={() => setChatVisible(true)}>
+              <Text style={styles.actionButtonText}>AI</Text>
+            </Pressable>
+          </View>
+        )}
+      </Pressable>
+    );
+  };
+
   return (
     <SafeAreaView style={styles.safeArea}>
-      <ScrollView contentContainerStyle={styles.content}>
-        <View style={styles.headerCard}>
-          <Text style={styles.kicker}>Rill CO</Text>
-          <Text style={styles.headerTitle}>Today&apos;s route</Text>
-          <Text style={styles.headerSubtitle}>{officerName}</Text>
-          <View style={styles.headerStats}>
-            <View style={styles.statCard}>
-              <Text style={styles.statLabel}>Collected</Text>
-              <Text style={styles.statValue}>NGN {stats.totalCollected.toLocaleString()}</Text>
-            </View>
-            <View style={styles.statCard}>
-              <Text style={styles.statLabel}>Check-ins</Text>
-              <Text style={styles.statValue}>{stats.checkInCount}</Text>
-            </View>
-          </View>
-          <Pressable style={styles.secondaryButton} onPress={() => signOut(auth)}>
-            <Text style={styles.secondaryButtonText}>Log out</Text>
+      <View style={styles.topHeader}>
+        <View>
+          <Text style={styles.headerTitle}>Rill Field</Text>
+          <Text style={styles.headerSubtitle}>{userData?.firstName} • {new Date().toLocaleDateString()}</Text>
+        </View>
+        <View style={styles.headerActions}>
+          <Pressable style={styles.plusButton} onPress={() => setAddUserVisible(true)}>
+            <Text style={styles.plusButtonText}>+ User</Text>
+          </Pressable>
+          <Pressable onPress={logout}>
+            <Text style={styles.logoutText}>Exit</Text>
           </Pressable>
         </View>
+      </View>
 
-        <View style={styles.infoCard}>
-          <Text style={styles.infoTitle}>Route intelligence</Text>
+      <ScrollView 
+        contentContainerStyle={styles.content}
+        refreshControl={<RefreshControl refreshing={refreshing} onRefresh={fetchData} />}
+      >
+        <Pressable style={styles.intelCard} onPress={optimizeRoute} disabled={routeLoading}>
+          <Text style={styles.intelTitle}>Route Intelligence</Text>
           {routeLoading ? (
-            <View style={styles.inlineLoader}>
-              <ActivityIndicator color="#4f46e5" />
-              <Text style={styles.infoText}>Optimizing merchant order...</Text>
-            </View>
+            <ActivityIndicator size="small" color="#4f46e5" />
           ) : (
-            <Text style={styles.infoText}>{routeReasoning}</Text>
+            <Text style={styles.intelText}>{routeReasoning || "Tap to optimize today's collection order."}</Text>
           )}
-        </View>
+        </Pressable>
 
-        {orderedMerchants.map((merchant, index) => {
-          const isSelected = selectedMerchant?.id === merchant.id;
-          return (
-            <Pressable
-              key={merchant.id}
-              style={[styles.merchantCard, isSelected ? styles.selectedMerchantCard : null]}
-              onPress={() => setSelectedMerchant(merchant)}
-            >
-              <View style={styles.merchantHeader}>
-                <View style={styles.rankBadge}>
-                  <Text style={styles.rankText}>{index + 1}</Text>
-                </View>
-                <View style={styles.merchantMain}>
-                  <Text style={styles.merchantName}>{merchant.name}</Text>
-                  <Text style={styles.merchantMeta}>{merchant.location}</Text>
-                  <Text style={styles.merchantMeta}>{merchant.businessType}</Text>
-                </View>
-                <View style={[styles.statusPill, statusStyles[merchant.status]]}>
-                  <Text style={[styles.statusText, statusTextStyles[merchant.status]]}>{merchant.status}</Text>
-                </View>
-              </View>
+        {groupedMerchants.urgent.length > 0 && (
+          <View style={styles.section}>
+            <Text style={styles.sectionTitle}>🔴 URGENT (48H+ NO PAY)</Text>
+            {groupedMerchants.urgent.map(renderMerchantCard)}
+          </View>
+        )}
 
-              <View style={styles.merchantStats}>
-                <View>
-                  <Text style={styles.statLabel}>Balance</Text>
-                  <Text style={styles.balanceValue}>NGN {merchant.balance.toLocaleString()}</Text>
-                </View>
-                <View>
-                  <Text style={styles.statLabel}>Daily target</Text>
-                  <Text style={styles.balanceValue}>NGN {merchant.dailyInstallment.toLocaleString()}</Text>
-                </View>
-                <View>
-                  <Text style={styles.statLabel}>Streak</Text>
-                  <Text style={styles.balanceValue}>{merchant.streak}d</Text>
-                </View>
-              </View>
+        {groupedMerchants.atRisk.length > 0 && (
+          <View style={styles.section}>
+            <Text style={styles.sectionTitle}>🟡 AT RISK (24H+ NO PAY)</Text>
+            {groupedMerchants.atRisk.map(renderMerchantCard)}
+          </View>
+        )}
 
-              {isSelected ? (
-                <View style={styles.actionsRow}>
-                  <Pressable style={styles.primaryButton} onPress={() => handleRepayment(merchant.id)}>
-                    <Text style={styles.primaryButtonText}>Collect</Text>
-                  </Pressable>
-                  <Pressable style={styles.actionButton} onPress={() => setCheckInVisible(true)}>
-                    <Text style={styles.actionButtonText}>Check-in</Text>
-                  </Pressable>
-                  <Pressable style={styles.actionButton} onPress={() => setChatVisible(true)}>
-                    <Text style={styles.actionButtonText}>AI rebuttal</Text>
-                  </Pressable>
-                </View>
-              ) : null}
-            </Pressable>
-          );
-        })}
+        {groupedMerchants.onTrack.length > 0 && (
+          <View style={styles.section}>
+            <Text style={styles.sectionTitle}>🟢 ON TRACK</Text>
+            {groupedMerchants.onTrack.map(renderMerchantCard)}
+          </View>
+        )}
+
+        {groupedMerchants.pending.length > 0 && (
+          <View style={styles.section}>
+            <Text style={styles.sectionTitle}>⚪ PENDING DISBURSEMENT</Text>
+            {groupedMerchants.pending.map(renderMerchantCard)}
+          </View>
+        )}
       </ScrollView>
 
-      <Modal visible={checkInVisible} animationType="slide" onRequestClose={() => setCheckInVisible(false)}>
+      {/* Add User Modal */}
+      <Modal visible={addUserVisible} animationType="slide">
         <SafeAreaView style={styles.modalShell}>
-          <ScrollView contentContainerStyle={styles.modalContent}>
-            <Text style={styles.modalTitle}>Merchant check-in</Text>
-            <Text style={styles.modalSubtitle}>{selectedMerchant?.name}</Text>
+          <View style={styles.modalHeader}>
+            <Text style={styles.modalTitle}>New Borrower</Text>
+            <Pressable onPress={() => setAddUserVisible(false)}><Text style={styles.closeText}>Close</Text></Pressable>
+          </View>
+          <View style={styles.modalContent}>
+            <TextInput 
+              placeholder="Full Name" 
+              style={styles.input} 
+              value={newUserForm.name}
+              onChangeText={t => setNewUserForm(f => ({...f, name: t}))}
+            />
+            <TextInput 
+              placeholder="Phone Number" 
+              style={styles.input} 
+              keyboardType="phone-pad"
+              value={newUserForm.phone}
+              onChangeText={t => setNewUserForm(f => ({...f, phone: t}))}
+            />
+            <TextInput 
+              placeholder="Location (Market/Stall)" 
+              style={styles.input} 
+              value={newUserForm.location}
+              onChangeText={t => setNewUserForm(f => ({...f, location: t}))}
+            />
+            <Pressable style={styles.primaryButton} onPress={handleAddUserSubmit}>
+              <Text style={styles.primaryButtonText}>Register User</Text>
+            </Pressable>
+          </View>
+        </SafeAreaView>
+      </Modal>
 
+      {/* Audit Modal */}
+      <Modal visible={checkInVisible} animationType="slide">
+        <SafeAreaView style={styles.modalShell}>
+          <View style={styles.modalHeader}>
+            <Text style={styles.modalTitle}>Field Audit: {selectedMerchant?.name}</Text>
+            <Pressable onPress={() => setCheckInVisible(false)}><Text style={styles.closeText}>Close</Text></Pressable>
+          </View>
+          <ScrollView style={styles.modalContent}>
             <Text style={styles.fieldLabel}>Mood</Text>
             <View style={styles.choiceRow}>
-              {(['positive', 'neutral', 'negative'] as const).map((value) => (
-                <Pressable
-                  key={value}
-                  style={[styles.choiceChip, checkInForm.mood === value ? styles.choiceChipSelected : null]}
-                  onPress={() => setCheckInForm((current) => ({ ...current, mood: value }))}
-                >
-                  <Text style={[styles.choiceChipText, checkInForm.mood === value ? styles.choiceChipTextSelected : null]}>
-                    {value}
-                  </Text>
+              {['positive', 'neutral', 'negative'].map(v => (
+                <Pressable key={v} style={[styles.choiceChip, checkInForm.mood === v && styles.choiceChipSelected]} onPress={() => setCheckInForm(f => ({...f, mood: v as any}))}>
+                  <Text style={styles.choiceText}>{v}</Text>
                 </Pressable>
               ))}
             </View>
-
-            <Text style={styles.fieldLabel}>Stock level</Text>
+            <Text style={styles.fieldLabel}>Stock Level</Text>
             <View style={styles.choiceRow}>
-              {(['high', 'medium', 'low'] as const).map((value) => (
-                <Pressable
-                  key={value}
-                  style={[styles.choiceChip, checkInForm.stockLevel === value ? styles.choiceChipSelected : null]}
-                  onPress={() => setCheckInForm((current) => ({ ...current, stockLevel: value }))}
-                >
-                  <Text
-                    style={[
-                      styles.choiceChipText,
-                      checkInForm.stockLevel === value ? styles.choiceChipTextSelected : null
-                    ]}
-                  >
-                    {value}
-                  </Text>
+              {['high', 'medium', 'low'].map(v => (
+                <Pressable key={v} style={[styles.choiceChip, checkInForm.stockLevel === v && styles.choiceChipSelected]} onPress={() => setCheckInForm(f => ({...f, stockLevel: v as any}))}>
+                  <Text style={styles.choiceText}>{v}</Text>
                 </Pressable>
               ))}
             </View>
-
-            <Text style={styles.fieldLabel}>Traffic</Text>
+            <Text style={styles.fieldLabel}>Market Traffic</Text>
             <View style={styles.choiceRow}>
-              {(['busy', 'normal', 'slow'] as const).map((value) => (
-                <Pressable
-                  key={value}
-                  style={[styles.choiceChip, checkInForm.marketTraffic === value ? styles.choiceChipSelected : null]}
-                  onPress={() => setCheckInForm((current) => ({ ...current, marketTraffic: value }))}
-                >
-                  <Text
-                    style={[
-                      styles.choiceChipText,
-                      checkInForm.marketTraffic === value ? styles.choiceChipTextSelected : null
-                    ]}
-                  >
-                    {value}
-                  </Text>
+              {['busy', 'normal', 'slow'].map(v => (
+                <Pressable key={v} style={[styles.choiceChip, checkInForm.marketTraffic === v && styles.choiceChipSelected]} onPress={() => setCheckInForm(f => ({...f, marketTraffic: v as any}))}>
+                  <Text style={styles.choiceText}>{v}</Text>
                 </Pressable>
               ))}
             </View>
-
-            <Text style={styles.fieldLabel}>Notes</Text>
-            <TextInput
-              multiline
-              placeholder="Any context from the visit?"
+            <TextInput 
+              placeholder="Field Notes..." 
+              style={styles.notesInput} 
+              multiline 
               value={checkInForm.notes}
-              onChangeText={(notes) => setCheckInForm((current) => ({ ...current, notes }))}
-              style={styles.notesInput}
+              onChangeText={t => setCheckInForm(f => ({...f, notes: t}))}
             />
-
-            <View style={styles.modalButtons}>
-              <Pressable style={styles.actionButton} onPress={() => setCheckInVisible(false)}>
-                <Text style={styles.actionButtonText}>Cancel</Text>
-              </Pressable>
-              <Pressable style={styles.primaryButton} onPress={handleCheckInSubmit}>
-                <Text style={styles.primaryButtonText}>Save check-in</Text>
-              </Pressable>
-            </View>
+            <Pressable style={styles.primaryButton} onPress={handleCheckInSubmit}>
+              <Text style={styles.primaryButtonText}>Save Audit</Text>
+            </Pressable>
           </ScrollView>
         </SafeAreaView>
       </Modal>
 
-      <Modal visible={chatVisible} animationType="slide" onRequestClose={() => setChatVisible(false)}>
-        <SafeAreaView style={styles.modalShell}>
-          <View style={styles.chatContainer}>
-            <View>
-              <Text style={styles.modalTitle}>AI rebuttal</Text>
-              <Text style={styles.modalSubtitle}>{selectedMerchant?.name}</Text>
+      {/* Escalate Modal */}
+      <Modal visible={escalateVisible} animationType="fade" transparent>
+        <View style={styles.centeredModal}>
+          <View style={styles.alertCard}>
+            <Text style={styles.modalTitle}>Escalate Risk</Text>
+            <Text style={styles.modalSubtitle}>Flag {selectedMerchant?.name} for immediate admin review.</Text>
+            <TextInput 
+              placeholder="Reason (e.g. Shop closed, Refusal)" 
+              style={styles.input}
+              value={escalateReason}
+              onChangeText={setEscalateReason}
+            />
+            <View style={styles.actionsRow}>
+              <Pressable style={styles.actionButton} onPress={() => setEscalateVisible(false)}>
+                <Text>Cancel</Text>
+              </Pressable>
+              <Pressable style={[styles.primaryButton, {backgroundColor: '#b91c1c'}]} onPress={handleEscalateSubmit}>
+                <Text style={styles.primaryButtonText}>Escalate</Text>
+              </Pressable>
             </View>
+          </View>
+        </View>
+      </Modal>
 
-            <ScrollView contentContainerStyle={styles.chatMessages}>
-              {chatHistory.length === 0 ? (
-                <Text style={styles.emptyChatText}>Enter the merchant&apos;s excuse and get a calm, firm response.</Text>
-              ) : null}
-              {chatHistory.map((message, index) => (
-                <View
-                  key={`${message.role}-${index}`}
-                  style={[styles.chatBubble, message.role === 'user' ? styles.userBubble : styles.aiBubble]}
-                >
-                  <Text style={[styles.chatText, message.role === 'user' ? styles.userBubbleText : null]}>
-                    {message.text}
-                  </Text>
+      {/* AI Rebuttal Modal */}
+      <Modal visible={chatVisible} animationType="slide">
+        <SafeAreaView style={styles.modalShell}>
+          <View style={styles.modalHeader}>
+            <Text style={styles.modalTitle}>AI Rebuttal</Text>
+            <Pressable onPress={() => setChatVisible(false)}><Text style={styles.closeText}>Close</Text></Pressable>
+          </View>
+          <View style={styles.chatContainer}>
+            <ScrollView style={styles.chatList}>
+              {chatHistory.map((m, i) => (
+                <View key={i} style={[styles.bubble, m.role === 'user' ? styles.userBubble : styles.aiBubble]}>
+                  <Text style={m.role === 'user' ? styles.userText : styles.aiText}>{m.text}</Text>
                 </View>
               ))}
-              {chatLoading ? (
-                <View style={styles.inlineLoader}>
-                  <ActivityIndicator color="#4f46e5" />
-                  <Text style={styles.infoText}>Thinking...</Text>
-                </View>
-              ) : null}
+              {chatLoading && <ActivityIndicator />}
             </ScrollView>
-
-            <TextInput
-              multiline
-              placeholder="Example: Sales are slow today."
-              value={chatMessage}
-              onChangeText={setChatMessage}
-              style={styles.notesInput}
-            />
-
-            <View style={styles.modalButtons}>
-              <Pressable style={styles.actionButton} onPress={() => setChatVisible(false)}>
-                <Text style={styles.actionButtonText}>Close</Text>
-              </Pressable>
-              <Pressable style={styles.primaryButton} onPress={handleChat} disabled={chatLoading}>
-                <Text style={styles.primaryButtonText}>Send</Text>
+            <View style={styles.chatInputRow}>
+              <TextInput 
+                placeholder="Merchant's excuse..." 
+                style={[styles.input, {flex: 1}]} 
+                value={chatMessage}
+                onChangeText={setChatMessage}
+              />
+              <Pressable style={styles.sendButton} onPress={handleChat}>
+                <Text style={styles.sendButtonText}>Go</Text>
               </Pressable>
             </View>
           </View>
@@ -391,295 +439,72 @@ export function FieldOfficerApp() {
 }
 
 const statusStyles = StyleSheet.create({
-  active: { backgroundColor: '#dcfce7' },
-  delinquent: { backgroundColor: '#fee2e2' },
-  'at-risk': { backgroundColor: '#fef3c7' }
+  urgent: { backgroundColor: '#fee2e2' },
+  'at-risk': { backgroundColor: '#fef3c7' },
+  'on-track': { backgroundColor: '#dcfce7' }
 });
 
 const statusTextStyles = StyleSheet.create({
-  active: { color: '#166534' },
-  delinquent: { color: '#991b1b' },
-  'at-risk': { color: '#92400e' }
+  urgent: { color: '#991b1b' },
+  'at-risk': { color: '#92400e' },
+  'on-track': { color: '#166534' }
 });
 
 const styles = StyleSheet.create({
-  safeArea: {
-    flex: 1,
-    backgroundColor: '#f8fafc'
-  },
-  content: {
-    padding: 16,
-    gap: 16
-  },
-  headerCard: {
-    backgroundColor: '#111827',
-    borderRadius: 24,
-    padding: 20,
-    gap: 10
-  },
-  kicker: {
-    color: '#c7d2fe',
-    fontSize: 12,
-    fontWeight: '700',
-    textTransform: 'uppercase'
-  },
-  headerTitle: {
-    color: '#ffffff',
-    fontSize: 28,
-    fontWeight: '700'
-  },
-  headerSubtitle: {
-    color: '#cbd5e1',
-    fontSize: 15
-  },
-  headerStats: {
-    flexDirection: 'row',
-    gap: 12,
-    marginTop: 8
-  },
-  statCard: {
-    flex: 1,
-    backgroundColor: '#1f2937',
-    borderRadius: 18,
-    padding: 14
-  },
-  statLabel: {
-    color: '#94a3b8',
-    fontSize: 12,
-    marginBottom: 4
-  },
-  statValue: {
-    color: '#ffffff',
-    fontSize: 18,
-    fontWeight: '700'
-  },
-  secondaryButton: {
-    alignSelf: 'flex-start',
-    backgroundColor: '#312e81',
-    borderRadius: 14,
-    paddingHorizontal: 14,
-    paddingVertical: 10,
-    marginTop: 4
-  },
-  secondaryButtonText: {
-    color: '#ffffff',
-    fontWeight: '600'
-  },
-  infoCard: {
-    backgroundColor: '#eef2ff',
-    borderRadius: 20,
-    padding: 16,
-    gap: 8
-  },
-  infoTitle: {
-    color: '#312e81',
-    fontSize: 16,
-    fontWeight: '700'
-  },
-  infoText: {
-    color: '#3730a3',
-    fontSize: 14,
-    lineHeight: 20
-  },
-  inlineLoader: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 10
-  },
-  merchantCard: {
-    backgroundColor: '#ffffff',
-    borderRadius: 22,
-    padding: 16,
-    borderWidth: 1,
-    borderColor: '#e2e8f0',
-    gap: 14
-  },
-  selectedMerchantCard: {
-    borderColor: '#4f46e5',
-    shadowColor: '#312e81',
-    shadowOpacity: 0.08,
-    shadowRadius: 10,
-    shadowOffset: { width: 0, height: 4 },
-    elevation: 2
-  },
-  merchantHeader: {
-    flexDirection: 'row',
-    gap: 12,
-    alignItems: 'flex-start'
-  },
-  rankBadge: {
-    width: 32,
-    height: 32,
-    borderRadius: 16,
-    backgroundColor: '#e0e7ff',
-    alignItems: 'center',
-    justifyContent: 'center'
-  },
-  rankText: {
-    color: '#3730a3',
-    fontWeight: '700'
-  },
-  merchantMain: {
-    flex: 1,
-    gap: 2
-  },
-  merchantName: {
-    fontSize: 18,
-    fontWeight: '700',
-    color: '#0f172a'
-  },
-  merchantMeta: {
-    color: '#64748b',
-    fontSize: 13
-  },
-  statusPill: {
-    borderRadius: 999,
-    paddingHorizontal: 10,
-    paddingVertical: 6
-  },
-  statusText: {
-    fontSize: 11,
-    fontWeight: '700',
-    textTransform: 'uppercase'
-  },
-  merchantStats: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    gap: 12
-  },
-  balanceValue: {
-    color: '#0f172a',
-    fontSize: 15,
-    fontWeight: '700'
-  },
-  actionsRow: {
-    flexDirection: 'row',
-    gap: 10
-  },
-  primaryButton: {
-    flex: 1,
-    backgroundColor: '#111827',
-    borderRadius: 16,
-    alignItems: 'center',
-    justifyContent: 'center',
-    paddingVertical: 14,
-    paddingHorizontal: 12
-  },
-  primaryButtonText: {
-    color: '#ffffff',
-    fontWeight: '700',
-    fontSize: 15
-  },
-  actionButton: {
-    flex: 1,
-    backgroundColor: '#eef2ff',
-    borderRadius: 16,
-    alignItems: 'center',
-    justifyContent: 'center',
-    paddingVertical: 14,
-    paddingHorizontal: 12
-  },
-  actionButtonText: {
-    color: '#3730a3',
-    fontWeight: '700',
-    fontSize: 15
-  },
-  modalShell: {
-    flex: 1,
-    backgroundColor: '#f8fafc'
-  },
-  modalContent: {
-    padding: 20,
-    gap: 16
-  },
-  modalTitle: {
-    fontSize: 24,
-    fontWeight: '700',
-    color: '#0f172a'
-  },
-  modalSubtitle: {
-    fontSize: 14,
-    color: '#64748b',
-    marginTop: 4
-  },
-  fieldLabel: {
-    color: '#334155',
-    fontWeight: '700',
-    marginTop: 8
-  },
-  choiceRow: {
-    flexDirection: 'row',
-    flexWrap: 'wrap',
-    gap: 10
-  },
-  choiceChip: {
-    borderWidth: 1,
-    borderColor: '#cbd5e1',
-    backgroundColor: '#ffffff',
-    borderRadius: 999,
-    paddingHorizontal: 14,
-    paddingVertical: 10
-  },
-  choiceChipSelected: {
-    borderColor: '#4f46e5',
-    backgroundColor: '#e0e7ff'
-  },
-  choiceChipText: {
-    color: '#475569',
-    fontWeight: '600',
-    textTransform: 'capitalize'
-  },
-  choiceChipTextSelected: {
-    color: '#3730a3'
-  },
-  notesInput: {
-    minHeight: 110,
-    borderWidth: 1,
-    borderColor: '#cbd5e1',
-    backgroundColor: '#ffffff',
-    borderRadius: 18,
-    padding: 14,
-    textAlignVertical: 'top'
-  },
-  modalButtons: {
-    flexDirection: 'row',
-    gap: 12,
-    marginTop: 8
-  },
-  chatContainer: {
-    flex: 1,
-    padding: 20,
-    gap: 16
-  },
-  chatMessages: {
-    flexGrow: 1,
-    gap: 12
-  },
-  emptyChatText: {
-    color: '#64748b',
-    lineHeight: 20
-  },
-  chatBubble: {
-    maxWidth: '88%',
-    borderRadius: 18,
-    paddingHorizontal: 14,
-    paddingVertical: 12
-  },
-  userBubble: {
-    backgroundColor: '#111827',
-    alignSelf: 'flex-end'
-  },
-  aiBubble: {
-    backgroundColor: '#ffffff',
-    borderWidth: 1,
-    borderColor: '#e2e8f0',
-    alignSelf: 'flex-start'
-  },
-  chatText: {
-    color: '#0f172a',
-    lineHeight: 20
-  },
-  userBubbleText: {
-    color: '#ffffff'
-  }
+  safeArea: { flex: 1, backgroundColor: '#f8fafc' },
+  topHeader: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', padding: 16, backgroundColor: '#fff', borderBottomWidth: 1, borderBottomColor: '#e2e8f0' },
+  headerTitle: { fontSize: 20, fontWeight: '800', color: '#1e1b4b' },
+  headerSubtitle: { fontSize: 12, color: '#64748b' },
+  headerActions: { flexDirection: 'row', alignItems: 'center', gap: 16 },
+  plusButton: { backgroundColor: '#1e1b4b', paddingHorizontal: 12, paddingVertical: 6, borderRadius: 8 },
+  plusButtonText: { color: '#fff', fontWeight: '700', fontSize: 12 },
+  logoutText: { color: '#ef4444', fontWeight: '600' },
+  content: { padding: 16, gap: 20 },
+  intelCard: { backgroundColor: '#eef2ff', padding: 16, borderRadius: 16, borderLeftWidth: 4, borderLeftColor: '#4f46e5' },
+  intelTitle: { fontWeight: '700', color: '#312e81', marginBottom: 4 },
+  intelText: { fontSize: 13, color: '#3730a3', lineHeight: 18 },
+  section: { gap: 12 },
+  sectionTitle: { fontSize: 12, fontWeight: '800', color: '#64748b', marginLeft: 4 },
+  merchantCard: { backgroundColor: '#fff', borderRadius: 16, padding: 16, borderWidth: 1, borderColor: '#e2e8f0', gap: 12 },
+  selectedMerchantCard: { borderColor: '#4f46e5', borderWidth: 2 },
+  merchantHeader: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'flex-start' },
+  merchantMain: { flex: 1 },
+  merchantName: { fontSize: 17, fontWeight: '700', color: '#0f172a' },
+  merchantMeta: { fontSize: 13, color: '#64748b', marginTop: 2 },
+  statusPill: { paddingHorizontal: 8, paddingVertical: 4, borderRadius: 6 },
+  statusText: { fontSize: 10, fontWeight: '800' },
+  merchantStats: { flexDirection: 'row', justifyContent: 'space-between', backgroundColor: '#f8fafc', padding: 10, borderRadius: 12 },
+  statLabel: { fontSize: 10, color: '#94a3b8', textTransform: 'uppercase', marginBottom: 2 },
+  balanceValue: { fontSize: 14, fontWeight: '700', color: '#1e293b' },
+  actionsRow: { flexDirection: 'row', gap: 8, marginTop: 4 },
+  primaryButton: { flex: 2, backgroundColor: '#1e1b4b', borderRadius: 12, paddingVertical: 12, alignItems: 'center', justifyContent: 'center' },
+  primaryButtonText: { color: '#fff', fontWeight: '700' },
+  actionButton: { flex: 1, backgroundColor: '#f1f5f9', borderRadius: 12, paddingVertical: 12, alignItems: 'center', justifyContent: 'center' },
+  actionButtonText: { fontSize: 12, fontWeight: '600', color: '#475569' },
+  escalateText: { fontSize: 12, fontWeight: '600', color: '#ef4444' },
+  modalShell: { flex: 1, backgroundColor: '#fff' },
+  modalHeader: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', padding: 16, borderBottomWidth: 1, borderBottomColor: '#e2e8f0' },
+  modalTitle: { fontSize: 18, fontWeight: '700' },
+  closeText: { color: '#4f46e5', fontWeight: '600' },
+  modalContent: { padding: 20, gap: 16 },
+  input: { backgroundColor: '#f8fafc', borderWidth: 1, borderColor: '#e2e8f0', borderRadius: 12, padding: 14, fontSize: 16 },
+  fieldLabel: { fontWeight: '700', color: '#475569', marginTop: 10 },
+  choiceRow: { flexDirection: 'row', gap: 8, flexWrap: 'wrap' },
+  choiceChip: { paddingHorizontal: 16, paddingVertical: 10, borderRadius: 10, borderWidth: 1, borderColor: '#e2e8f0' },
+  choiceChipSelected: { backgroundColor: '#eef2ff', borderColor: '#4f46e5' },
+  choiceText: { fontWeight: '600', color: '#1e293b' },
+  notesInput: { backgroundColor: '#f8fafc', borderWidth: 1, borderColor: '#e2e8f0', borderRadius: 12, padding: 14, height: 100, textAlignVertical: 'top' },
+  centeredModal: { flex: 1, justifyContent: 'center', alignItems: 'center', backgroundColor: 'rgba(0,0,0,0.5)', padding: 20 },
+  alertCard: { backgroundColor: '#fff', borderRadius: 20, padding: 20, width: '100%', gap: 16 },
+  modalSubtitle: { fontSize: 14, color: '#64748b' },
+  chatContainer: { flex: 1, padding: 16 },
+  chatList: { flex: 1, gap: 12 },
+  bubble: { padding: 12, borderRadius: 16, maxWidth: '85%', marginBottom: 10 },
+  userBubble: { alignSelf: 'flex-end', backgroundColor: '#1e1b4b' },
+  aiBubble: { alignSelf: 'flex-start', backgroundColor: '#f1f5f9' },
+  userText: { color: '#fff' },
+  aiText: { color: '#1e293b' },
+  chatInputRow: { flexDirection: 'row', gap: 10, paddingVertical: 10 },
+  sendButton: { backgroundColor: '#4f46e5', width: 50, borderRadius: 12, alignItems: 'center', justifyContent: 'center' },
+  sendButtonText: { color: '#fff', fontWeight: '700' }
 });

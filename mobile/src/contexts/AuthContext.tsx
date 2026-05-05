@@ -1,65 +1,37 @@
-import React, { createContext, useContext, useEffect, useMemo, useState } from 'react';
-import { onAuthStateChanged, type User } from 'firebase/auth';
-import { doc, getDoc } from 'firebase/firestore';
-import { auth, db } from '../firebase';
+import React, { createContext, useContext, useMemo, useState } from 'react';
 import type { UserRole } from '../types';
 
 interface UserData {
-  firstName?: string;
-  lastName?: string;
-  email?: string;
-  role?: UserRole;
-  createdAt?: string;
+  id: string;
+  firstName: string;
+  lastName: string;
+  email: string;
+  role: UserRole;
 }
 
 interface AuthContextValue {
-  user: User | null;
   userData: UserData | null;
   role: UserRole;
   loading: boolean;
-  setRole: (role: UserRole) => void;
+  setUserData: (data: UserData | null) => void;
+  logout: () => void;
 }
 
 const AuthContext = createContext<AuthContextValue | undefined>(undefined);
 
 export function AuthProvider({ children }: { children: React.ReactNode }) {
-  const [user, setUser] = useState<User | null>(null);
   const [userData, setUserData] = useState<UserData | null>(null);
-  const [role, setRole] = useState<UserRole>('onboarding');
-  const [loading, setLoading] = useState(true);
+  const [loading, setLoading] = useState(false); // No initial loading needed for now
 
-  useEffect(() => {
-    const unsubscribe = onAuthStateChanged(auth, async (currentUser) => {
-      setUser(currentUser);
+  const role: UserRole = userData ? 'co' : 'onboarding';
 
-      if (!currentUser) {
-        setUserData(null);
-        setRole('onboarding');
-        setLoading(false);
-        return;
-      }
-
-      try {
-        const userDoc = await getDoc(doc(db, 'users', currentUser.uid));
-        if (userDoc.exists()) {
-          const data = userDoc.data() as UserData;
-          setUserData(data);
-          setRole(data.role ?? 'onboarding');
-        } else {
-          setUserData(null);
-          setRole('onboarding');
-        }
-      } finally {
-        setLoading(false);
-      }
-    });
-
-    return unsubscribe;
-  }, []);
+  const logout = () => {
+    setUserData(null);
+  };
 
   const value = useMemo(
-    () => ({ user, userData, role, loading, setRole }),
-    [user, userData, role, loading]
+    () => ({ userData, role, loading, setUserData, logout }),
+    [userData, role, loading]
   );
 
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;

@@ -3,21 +3,20 @@ export type UserRole = 'onboarding' | 'lender' | 'admin' | 'co';
 export interface Merchant {
   id: string;
   name: string;
-  businessType: string;
+  phone: string;
   location: string;
-  clusterId: string;
+  groupId: string | null;
+  totalOwed: number;
   balance: number;
   dailyInstallment: number;
-  propensityToPay: number;
-  streak: number;
-  lastPaymentDate: string;
-  status: 'active' | 'delinquent' | 'at-risk';
-  gsiLinked: boolean;
+  status: 'pending' | 'active' | 'deactivated';
+  lastPaymentDate: string | null;
+  internalStatus: 'urgent' | 'at-risk' | 'on-track';
 }
 
 export interface CheckInLog {
   id: string;
-  merchantId: string;
+  userId: string;
   timestamp: string;
   mood: 'positive' | 'neutral' | 'negative';
   stockLevel: 'high' | 'medium' | 'low';
@@ -27,7 +26,7 @@ export interface CheckInLog {
 
 export interface Repayment {
   id: string;
-  merchantId: string;
+  userId: string;
   amount: number;
   timestamp: string;
   method: 'cash' | 'pos' | 'transfer';

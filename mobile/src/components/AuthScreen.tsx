@@ -9,11 +9,8 @@ import {
   TextInput,
   View
 } from 'react-native';
-import { createUserWithEmailAndPassword, signInWithEmailAndPassword } from 'firebase/auth';
-import { doc, setDoc } from 'firebase/firestore';
-import { auth, db } from '../firebase';
+import { login, register } from '../services/api';
 import { useAuth } from '../contexts/AuthContext';
-import type { UserRole } from '../types';
 
 export function AuthScreen() {
   const [isLogin, setIsLogin] = useState(true);
@@ -22,26 +19,33 @@ export function AuthScreen() {
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [loading, setLoading] = useState(false);
-  const { setRole } = useAuth();
+  const { setUserData } = useAuth();
 
   const handleAuth = async () => {
+    if (!email || !password) {
+      Alert.alert('Error', 'Please fill in all fields');
+      return;
+    }
+
     setLoading(true);
     try {
       if (isLogin) {
-        await signInWithEmailAndPassword(auth, email.trim(), password);
-        return;
+        const response = await login(email.trim(), password);
+        setUserData({ ...response.officer, role: 'co' });
+      } else {
+        if (!firstName || !lastName) {
+          Alert.alert('Error', 'Please provide your name');
+          setLoading(false);
+          return;
+        }
+        const response = await register({
+          email: email.trim(),
+          password,
+          firstName: firstName.trim(),
+          lastName: lastName.trim()
+        });
+        setUserData({ ...response.officer, role: 'co' });
       }
-
-      const credential = await createUserWithEmailAndPassword(auth, email.trim(), password);
-      const role: UserRole = 'co';
-      await setDoc(doc(db, 'users', credential.user.uid), {
-        firstName: firstName.trim(),
-        lastName: lastName.trim(),
-        email: email.trim(),
-        role,
-        createdAt: new Date().toISOString()
-      });
-      setRole(role);
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Authentication failed';
       Alert.alert('Rill CO', message);

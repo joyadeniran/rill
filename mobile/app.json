@@ -1,12 +1,21 @@
 {
   "expo": {
     "name": "Rill CO",
-    "slug": "rill-co",
+    "slug": "rill",
     "version": "1.0.0",
     "orientation": "portrait",
     "userInterfaceStyle": "light",
     "assetBundlePatterns": [
       "**/*"
-    ]
+    ],
+    "extra": {
+      "eas": {
+        "projectId": "f82dddaf-c4c6-403a-9ee4-36ff78282e4a"
+      }
+    },
+    "owner": "supplyashop",
+    "android": {
+      "package": "com.supplyashop.rill"
+    }
   }
 }

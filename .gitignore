@@ -6,3 +6,7 @@ coverage/
 *.log
 .env*
 !.env.example
+rill.db
+rill.db-journal
+rill.db-shm
+rill.db-wal
