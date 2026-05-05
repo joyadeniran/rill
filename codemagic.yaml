@@ -1,14 +1,17 @@
 workflows:
-  android-build:
-    name: Rill Android APK Build
+  android-apk:
+    name: Rill Android APK (Production)
     max_build_duration: 60
     instance_type: mac_mini_m1
     environment:
-      groups:
-        - rill_vars # Create this group in Codemagic UI and add EXPO_TOKEN
       vars:
         EXPO_PUBLIC_API_BASE_URL: "https://rill-app.onrender.com/api"
+        # Add EXPO_TOKEN to Codemagic environment variables for automated login
       node: 20
+    cache:
+      cache_paths:
+        - $CM_BUILD_DIR/mobile/node_modules
+        - $HOME/.gradle/caches
     scripts:
       - name: Install dependencies
         script: |
@@ -20,8 +23,9 @@ workflows:
       - name: Run Expo Prebuild
         script: |
           cd mobile
-          npx expo prebuild
-      - name: Build Android APK
+          # This generates the /android folder for the local build
+          npx expo prebuild --platform android --no-install
+      - name: Build Android APK (Local)
         script: |
           cd mobile/android
           ./gradlew assembleRelease
@@ -30,7 +34,7 @@ workflows:
     publishing:
       email:
         recipients:
-          - your-email@example.com # Update this
+          - your-email@example.com # Change this to your email
         notify:
           success: true
           failure: true
