@@ -70,10 +70,13 @@ export async function recordRepayment(data: { userId: string; amount: number; me
   });
 }
 
-export async function recordAudit(data: { userId: string; mood: string; stockLevel: string; traffic: string; notes: string }) {
+export async function recordAudit(data: { userId: string; mood: string; stockLevel: string; marketTraffic: string; notes: string }) {
   return request<{ success: boolean; id: string }>('/audits', {
     method: 'POST',
-    body: JSON.stringify(data)
+    body: JSON.stringify({
+      ...data,
+      traffic: data.marketTraffic
+    })
   });
 }
 

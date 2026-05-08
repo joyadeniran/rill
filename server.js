@@ -5,7 +5,7 @@ import dotenv from 'dotenv';
 import { GoogleGenAI, Type } from '@google/genai';
 import Database from 'better-sqlite3';
 import pg from 'pg';
-import { randomUUID } from 'crypto';
+import { randomUUID, scryptSync, timingSafeEqual } from 'crypto';
 import { body, validationResult } from 'express-validator';
 
 import path from 'path';
@@ -84,6 +84,27 @@ async function runTransaction(queries) {
   }
 }
 
+function hashPassword(password) {
+  const salt = randomUUID();
+  const derivedKey = scryptSync(password, salt, 64).toString('hex');
+  return `scrypt$${salt}$${derivedKey}`;
+}
+
+function isHashedPassword(password) {
+  return typeof password === 'string' && password.startsWith('scrypt$');
+}
+
+function verifyPassword(password, storedPassword) {
+  if (!isHashedPassword(storedPassword)) {
+    return password === storedPassword;
+  }
+
+  const [, salt, storedHash] = storedPassword.split('$');
+  const derivedBuffer = scryptSync(password, salt, 64);
+  const storedBuffer = Buffer.from(storedHash, 'hex');
+  return storedBuffer.length === derivedBuffer.length && timingSafeEqual(storedBuffer, derivedBuffer);
+}
+
 // Initialize Schema
 const initDb = async () => {
   const schema = `
@@ -143,7 +164,12 @@ const initDb = async () => {
   }
 };
 
-initDb().catch(console.error);
+const initDbPromise = initDb();
+
+app.use(async (req, res, next) => {
+  await initDbPromise;
+  next();
+});
 
 // --- AI LAYER ---
 const aiKey = process.env.GEMINI_API_KEY;
@@ -172,8 +198,9 @@ app.post('/api/auth/register', [
   const { email, password, firstName, lastName } = req.body;
   const id = randomUUID();
   try {
+    const passwordHash = hashPassword(password);
     await query('INSERT INTO officers (id, email, password, first_name, last_name) VALUES (?, ?, ?, ?, ?)', 
-      [id, email, password, firstName, lastName]);
+      [id, email, passwordHash, firstName, lastName]);
     res.json({ officer: { id, email, firstName, lastName } });
   } catch (error) {
     res.status(400).json({ error: 'Registration failed' });
@@ -184,7 +211,10 @@ app.post('/api/auth/login', async (req, res) => {
   const { email, password } = req.body;
   const { rows } = await query('SELECT id, email, password, first_name as "firstName", last_name as "lastName" FROM officers WHERE email = ?', [email]);
   const officer = rows[0];
-  if (officer && officer.password === password) {
+  if (officer && verifyPassword(password, officer.password)) {
+    if (!isHashedPassword(officer.password)) {
+      await query('UPDATE officers SET password = ? WHERE id = ?', [hashPassword(password), officer.id]);
+    }
     const { password: _, ...safeOfficer } = officer;
     res.json({ officer: safeOfficer });
   } else {
@@ -266,17 +296,49 @@ app.post('/api/optimize-route', checkAi, async (req, res) => {
     const { merchants } = req.body;
     const prompt = `As a Nigerian Credit Risk Specialist for Rill, optimize the collection route for today. 
 Merchants: ${JSON.stringify(merchants)}. Priority to 'urgent' and 'at-risk'. Output JSON with prioritizedIds and reasoning.`;
-    const model = ai.getGenerativeModel({ model: "gemini-1.5-flash" });
-    const result = await model.generateContent(prompt);
-    res.json(JSON.parse(result.response.text().replace(/```json|```/g, '') || '{}'));
+    const response = await ai.models.generateContent({
+      model: 'gemini-1.5-flash',
+      contents: prompt,
+      config: {
+        responseMimeType: 'application/json',
+        responseSchema: {
+          type: Type.OBJECT,
+          properties: {
+            prioritizedIds: {
+              type: Type.ARRAY,
+              items: { type: Type.STRING }
+            },
+            reasoning: { type: Type.STRING }
+          },
+          required: ['prioritizedIds', 'reasoning']
+        }
+      }
+    });
+    res.json(JSON.parse(response.text || '{}'));
 });
 
 app.post('/api/rebuttal', checkAi, async (req, res) => {
     const { merchantName, excuse } = req.body;
     const prompt = `Merchant ${merchantName} says: "${excuse}". Firm professional rebuttal, < 3 sentences, calm accountability.`;
-    const model = ai.getGenerativeModel({ model: "gemini-1.5-flash" });
-    const result = await model.generateContent(prompt);
-    res.json({ text: result.response.text() });
+    const response = await ai.models.generateContent({
+      model: 'gemini-1.5-flash',
+      contents: prompt
+    });
+    res.json({ text: response.text });
+});
+
+app.post('/api/risk-briefing', checkAi, async (req, res) => {
+    const { logs, merchants } = req.body;
+    const prompt = `Summarize the day's field activity for the Head of Credit.
+Field Logs: ${JSON.stringify(logs)}
+Merchant Status: ${JSON.stringify(merchants)}
+Provide a 3-sentence risk briefing highlighting any behavioral shifts or cluster-level trends.`;
+
+    const response = await ai.models.generateContent({
+      model: 'gemini-1.5-flash',
+      contents: prompt
+    });
+    res.json({ text: response.text });
 });
 
 app.use((err, req, res, next) => {

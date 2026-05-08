@@ -102,7 +102,7 @@ export function FieldOfficerApp() {
     return {
       urgent: sorted.filter(m => m.internalStatus === 'urgent'),
       atRisk: sorted.filter(m => m.internalStatus === 'at-risk'),
-      onTrack: sorted.filter(m => m.internalStatus === 'on-track'),
+      onTrack: sorted.filter(m => m.internalStatus === 'on-track' && m.status !== 'pending'),
       pending: sorted.filter(m => m.status === 'pending')
     };
   }, [merchants, routeOrder]);
