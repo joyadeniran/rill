@@ -1,0 +1,104 @@
+# Rill Mobile App — Crash Investigation & Hardening Log
+
+**Date:** 2026-06-03
+**Branch:** `claude/mobile-app-crash-debug-gIPti`
+**Scope:** Diagnose why the Rill field-officer mobile app (Expo SDK 53 / RN 0.79.3 / React 19) crashes, fix the root causes, harden the backend it depends on, add regression tests, and make the stack production-ready.
+
+---
+
+## 1. Method
+
+- Read every mobile source file, the Express backend (`server.js`), tests, and all build/deploy configs (`app.json`, `eas.json`, `codemagic.yaml`, `render.yaml`).
+- Deployed two parallel audit agents (mobile + backend) for fan-out coverage.
+- **Verified every hypothesis empirically** instead of trusting static reasoning. Installed dependencies and ran the real test suite + TypeScript typecheck.
+
+### Claims that were REFUTED by running the code (important)
+- *"Backend tests #3/#5 fail because `better-sqlite3` throws on `undefined` bindings."* — **False.** `npm test` showed **8/8 passing**, and a direct probe proved `better-sqlite3` v12.4.1 **coerces `undefined`→`null`** (it does not throw). Evidence:
+  ```
+  UNDEFINED BIND: did NOT throw -> rows: [ { id: '1', phone: null, notes: 'x' } ]
+  ```
+  These findings were therefore **not** treated as root causes. Defensive `?? null` coercion was still added for cross-DB clarity, but it is hardening, not a bug fix.
+
+---
+
+## 2. Root Causes (confirmed, with evidence)
+
+### Mobile (the actual crash surface)
+
+| ID | Severity | Location | Root cause |
+|----|----------|----------|------------|
+| M1 | **CRASH amplifier** | `App.tsx` | **No Error Boundary.** In a release build there is no RN red-screen; any render exception unmounts the whole tree → hard crash to OS with no recovery. Every render bug below escalates to a full app crash because of this. |
+| M2 | **CRASH** | `FieldOfficerApp.tsx:212,216,123` | `merchant.balance.toLocaleString()` / `merchant.dailyInstallment.toLocaleString()` — `null.toLocaleString()` throws `TypeError`. DB `DEFAULT 0` protects *current* rows, but any nullable numeric (future migration, partial payload) crashes the card render. |
+| M3 | **CRASH** | `FieldOfficerApp.tsx:62-72 → 93 → 103-106` | `setMerchants(data)` trusts the response is an array. A non-array body (proxy/HTML error page, cold-start body returned with 200) makes `[...merchants].sort()` throw **inside `useMemo` during render** — outside the `fetchData` try/catch — so it crashes. |
+| M4 | **CRASH/launch** | `mobile/package.json` | `expo-dev-client` shipped in **`dependencies`** and `metro` **pinned directly** in `dependencies`. Both are well-known Expo anti-patterns: a dev-client module linked into a `assembleRelease` APK and a hand-pinned metro version conflicting with Expo's managed metro cause white-screen / bundler / launch failures. |
+| M5 | BUG/RISK | `api.ts:4-7` | Release builds fell back to **cleartext `http://10.0.2.2`** when `EXPO_PUBLIC_API_BASE_URL` was unset — Android release blocks cleartext, so every request fails (functional dead-app). |
+| M6 | BUG/RISK | `api.ts:9-24` | **No request timeout.** Render free-tier cold start (30–60s) leaves the UI hung on a spinner indefinitely with no recovery. |
+
+### Backend (cascade / robustness)
+
+| ID | Severity | Location | Root cause |
+|----|----------|----------|------------|
+| B1 | BUG | `server.js` login route | `/api/auth/login` had **no input validation** → missing fields produced an inconsistent **500 (SQLite/hashed path)** vs 401 (Postgres). |
+| B2 | BUG | `server.js` payments | `amount` validated only with `isNumeric()` → a **negative amount inflates the balance** (`balance = balance - (-x)`). |
+| B3 | BUG/RISK | `server.js` AI routes | `JSON.parse(response.text || '{}')` throws server-side on malformed/blocked model output → 500; `response.text` may be `undefined`; model `gemini-1.5-flash` is a legacy alias subject to retirement. |
+| B4 | RISK | `server.js` initDb | A single `initDb()` rejection (DB unreachable at cold start) was **cached forever** → every subsequent request 500s for the life of the process, with no retry. |
+
+> Out of scope but noted for follow-up: no auth on data endpoints, wide-open CORS, SQLite-vs-Postgres `TIMESTAMP` (no tz) drift affecting `internalStatus`, no auth persistence on the client (re-login every cold start). See §5.
+
+---
+
+## 3. Changes Made
+
+### Mobile
+- **`mobile/src/components/ErrorBoundary.tsx`** *(new)* — class error boundary with a friendly fallback + "Try again" reset. Converts crashes into recoverable states (fixes M1).
+- **`mobile/App.tsx`** — wrapped `<AuthProvider><AppContent/></AuthProvider>` in `<ErrorBoundary>`.
+- **`mobile/src/services/api.ts`**:
+  - Production HTTPS fallback (`productionApiBaseUrl`) selected via `__DEV__`; no more silent cleartext-localhost fallback in release (fixes M5).
+  - `AbortController` + 30s timeout on every request; friendly timeout/network error messages (fixes M6).
+  - Guarded `response.json()` parse on the success path (handles non-JSON 200 bodies).
+  - `getTodayRoute()` now returns `[]` if the payload is not an array (fixes M3 at the source).
+- **`mobile/src/components/FieldOfficerApp.tsx`**:
+  - `Number(merchant.balance ?? 0).toLocaleString()` and same for `dailyInstallment` (fixes M2).
+  - `handleRepayment` coerces `balance`/`amount` and guards a zero installment.
+  - `optimizeRoute` validates `prioritizedIds` is an array and `reasoning` is a string.
+- **`mobile/package.json`** — moved `expo-dev-client` to `devDependencies`; removed the direct `metro` pin (Expo manages it transitively) (fixes M4). Lockfile regenerated.
+
+### Backend (`server.js`)
+- Added `body('email').isEmail()` + `body('password').notEmpty()` + `validate` to `/api/auth/login` (fixes B1).
+- `/api/payments` `amount` now `isInt({ gt: 0 })` (fixes B2).
+- AI layer: configurable `AI_MODEL` (`process.env.GEMINI_MODEL || 'gemini-2.0-flash'`), `safeJsonParse()` helper, route returns a validated `{ prioritizedIds, reasoning }` shape, and `response.text || ''` guards on rebuttal/briefing (fixes B3).
+- `initDb` memoization now clears a rejected promise so the next request retries; init middleware returns `503` while initializing instead of poisoning forever (fixes B4).
+- Explicit `?? null` coercion for optional insert params in `/api/users` and `/api/audits` (cross-DB hardening).
+
+### Tests (`server.test.js`)
+Added 8 regression tests: login missing-fields → 400, wrong creds → 401, full register→login round-trip (and password never leaked), negative & zero payment → 400, audit with only required field → 200, user without phone → 200, and `/api/today` shape assertions (numeric `balance`/`dailyInstallment`, valid `internalStatus`).
+
+---
+
+## 4. Verification (evidence)
+
+```
+# Backend test suite
+Tests:       16 passed, 16 total      (was 8; +8 new regression tests)
+
+# Mobile TypeScript typecheck
+TYPECHECK EXIT: 0  (typecheck OK)
+
+# better-sqlite3 undefined-binding probe
+UNDEFINED BIND: did NOT throw -> rows: [ { id: '1', phone: null, notes: 'x' } ]
+```
+
+- No source change to root dependencies; the incidental root `package-lock.json` churn (npm `libc` metadata normalization) was reverted to keep the diff clean.
+- `metro` confirmed still present in the mobile lockfile as an Expo transitive dependency after removing the direct pin.
+
+---
+
+## 5. Mitigation / Future-Proofing (recommended next, not yet done)
+
+1. **Authn/authz on data endpoints** — issue a token at login; require it on `/api/today`, `/api/payments`, `/api/users`, `/api/escalations`. Today anyone can read merchants and post payments.
+2. **Lock down CORS** to known web/mobile origins.
+3. **Postgres `TIMESTAMPTZ`** — `TIMESTAMP` (no tz) shifts `internalStatus` thresholds by the server's UTC offset; store/compare in UTC consistently across SQLite and Postgres.
+4. **Client auth persistence** — `expo-secure-store` so officers aren't logged out on every cold start (the `loading` state in `AuthContext` is currently dead code).
+5. **CI gate** — run `npm test` + `cd mobile && npx tsc --noEmit` on every PR; add `expo-doctor` to the Codemagic pipeline to catch dependency drift.
+6. **Crash reporting** — wire Sentry/Crashlytics into the new `ErrorBoundary` to capture production crashes with stack traces.
+7. **Render warm-keep** — a scheduled ping (or paid plan) to avoid 30–60s cold-start latency on the free tier.

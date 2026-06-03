@@ -3,6 +3,7 @@ import { ActivityIndicator, SafeAreaView, StatusBar, StyleSheet, Text, View } fr
 import { AuthProvider, useAuth } from './src/contexts/AuthContext';
 import { AuthScreen } from './src/components/AuthScreen';
 import { FieldOfficerApp } from './src/components/FieldOfficerApp';
+import { ErrorBoundary } from './src/components/ErrorBoundary';
 
 function AppContent() {
   const { loading, role } = useAuth();
@@ -33,9 +34,11 @@ function AppContent() {
 
 export default function App() {
   return (
-    <AuthProvider>
-      <AppContent />
-    </AuthProvider>
+    <ErrorBoundary>
+      <AuthProvider>
+        <AppContent />
+      </AuthProvider>
+    </ErrorBoundary>
   );
 }
 

@@ -1,26 +1,60 @@
 import { Platform } from 'react-native';
 import type { CheckInLog, Merchant, Repayment } from '../types';
 
-const defaultApiBaseUrl =
+// Production HTTPS endpoint. Used for release builds (and whenever a build-time
+// EXPO_PUBLIC_API_BASE_URL is not supplied) so we never silently fall back to a
+// cleartext localhost URL that Android release builds block.
+const productionApiBaseUrl = 'https://rill-app.onrender.com/api';
+
+const devApiBaseUrl =
   Platform.OS === 'android' ? 'http://10.0.2.2:3001/api' : 'http://localhost:3001/api';
+
+const defaultApiBaseUrl =
+  typeof __DEV__ !== 'undefined' && __DEV__ ? devApiBaseUrl : productionApiBaseUrl;
 
 const API_BASE_URL = process.env.EXPO_PUBLIC_API_BASE_URL || defaultApiBaseUrl;
 
+// Render free-tier cold starts can take 30-60s; without a ceiling a request can
+// hang forever, leaving the UI stuck on a spinner. Abort instead so callers can
+// surface a friendly error.
+const REQUEST_TIMEOUT_MS = 30000;
+
 async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
-  const response = await fetch(`${API_BASE_URL}${path}`, {
-    ...options,
-    headers: {
-      'Content-Type': 'application/json',
-      ...options.headers
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+
+  let response: Response;
+  try {
+    response = await fetch(`${API_BASE_URL}${path}`, {
+      ...options,
+      signal: controller.signal,
+      headers: {
+        'Content-Type': 'application/json',
+        ...options.headers
+      }
+    });
+  } catch (error) {
+    if (error instanceof Error && error.name === 'AbortError') {
+      throw new Error('Request timed out. Please check your connection and retry.');
     }
-  });
+    throw new Error('Network request failed. Please check your connection.');
+  } finally {
+    clearTimeout(timeout);
+  }
 
   if (!response.ok) {
-    const errorData = await response.json().catch(() => ({}));
+    const errorData = await response.json().catch(() => ({} as { error?: string }));
     throw new Error(errorData.error || `Request failed with status ${response.status}`);
   }
 
-  return response.json() as Promise<T>;
+  // A 200 response can still carry a non-JSON body (proxy/HTML error page,
+  // empty body during cold start). Guard the parse so it surfaces as a handled
+  // error instead of an unguarded throw inside a render path.
+  try {
+    return (await response.json()) as T;
+  } catch {
+    throw new Error('Received an invalid response from the server.');
+  }
 }
 
 // --- AUTH ---
@@ -51,7 +85,10 @@ export async function register(data: { email: string; password: string; firstNam
 // --- USERS / MERCHANTS ---
 
 export async function getTodayRoute(): Promise<Merchant[]> {
-  return request<Merchant[]>('/today');
+  const data = await request<Merchant[]>('/today');
+  // The server returns a JSON array; defend the render path against any
+  // unexpected shape (proxy error object, etc.) that would break `[...data]`.
+  return Array.isArray(data) ? data : [];
 }
 
 export async function createUser(data: { name: string; phone: string; location: string; groupId?: string }) {

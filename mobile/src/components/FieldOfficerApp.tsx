@@ -80,8 +80,8 @@ export function FieldOfficerApp() {
     setRouteLoading(true);
     try {
       const result = await getRouteOptimization(merchants);
-      setRouteOrder(result.prioritizedIds ?? []);
-      setRouteReasoning(result.reasoning ?? '');
+      setRouteOrder(Array.isArray(result?.prioritizedIds) ? result.prioritizedIds : []);
+      setRouteReasoning(typeof result?.reasoning === 'string' ? result.reasoning : '');
     } catch {
       setRouteReasoning('Intelligence unavailable. Using default order.');
     } finally {
@@ -108,11 +108,16 @@ export function FieldOfficerApp() {
   }, [merchants, routeOrder]);
 
   const handleRepayment = async (merchant: Merchant) => {
-    if (merchant.balance <= 0) {
+    const balance = Number(merchant.balance ?? 0);
+    const amount = Number(merchant.dailyInstallment ?? 0);
+    if (balance <= 0) {
       Alert.alert('No balance', 'This merchant has no outstanding balance.');
       return;
     }
-    const amount = merchant.dailyInstallment;
+    if (amount <= 0) {
+      Alert.alert('No installment', 'This merchant has no daily installment set.');
+      return;
+    }
     try {
       await recordRepayment({
         userId: merchant.id,
@@ -209,11 +214,11 @@ export function FieldOfficerApp() {
         <View style={styles.merchantStats}>
           <View>
             <Text style={styles.statLabel}>Owed</Text>
-            <Text style={styles.balanceValue}>N{merchant.balance.toLocaleString()}</Text>
+            <Text style={styles.balanceValue}>N{Number(merchant.balance ?? 0).toLocaleString()}</Text>
           </View>
           <View>
             <Text style={styles.statLabel}>Daily</Text>
-            <Text style={styles.balanceValue}>N{merchant.dailyInstallment.toLocaleString()}</Text>
+            <Text style={styles.balanceValue}>N{Number(merchant.dailyInstallment ?? 0).toLocaleString()}</Text>
           </View>
           <View>
             <Text style={styles.statLabel}>Last</Text>

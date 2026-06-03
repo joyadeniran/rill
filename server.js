@@ -164,16 +164,47 @@ const initDb = async () => {
   }
 };
 
-const initDbPromise = initDb();
+// Memoize the init promise, but if it rejects (e.g. DB unreachable at cold
+// start) clear it so the NEXT request retries instead of every request being
+// permanently poisoned by a single cached rejection.
+let initDbPromise = null;
+function ensureDbReady() {
+  if (!initDbPromise) {
+    initDbPromise = initDb().catch((err) => {
+      initDbPromise = null;
+      throw err;
+    });
+  }
+  return initDbPromise;
+}
+
+// Kick off init eagerly without leaving an unhandled rejection at boot.
+ensureDbReady().catch((err) => console.error('Initial DB init failed, will retry on first request:', err.message));
 
 app.use(async (req, res, next) => {
-  await initDbPromise;
-  next();
+  try {
+    await ensureDbReady();
+    next();
+  } catch (err) {
+    res.status(503).json({ error: 'Service initializing, please retry shortly' });
+  }
 });
 
 // --- AI LAYER ---
 const aiKey = process.env.GEMINI_API_KEY;
 const ai = aiKey ? new GoogleGenAI({ apiKey: aiKey }) : null;
+// Configurable so the model can be updated without a code change as Google
+// retires older aliases. Defaults to a current, generally-available model.
+const AI_MODEL = process.env.GEMINI_MODEL || 'gemini-2.0-flash';
+
+function safeJsonParse(text, fallback) {
+  try {
+    const parsed = JSON.parse(text || '{}');
+    return parsed && typeof parsed === 'object' ? parsed : fallback;
+  } catch {
+    return fallback;
+  }
+}
 
 const checkAi = (req, res, next) => {
   if (!ai) return res.status(503).json({ error: 'AI features temporarily unavailable' });
@@ -207,7 +238,11 @@ app.post('/api/auth/register', [
   }
 });
 
-app.post('/api/auth/login', async (req, res) => {
+app.post('/api/auth/login', [
+  body('email').isEmail(),
+  body('password').notEmpty(),
+  validate
+], async (req, res) => {
   const { email, password } = req.body;
   const { rows } = await query('SELECT id, email, password, first_name as "firstName", last_name as "lastName" FROM officers WHERE email = ?', [email]);
   const officer = rows[0];
@@ -254,14 +289,14 @@ app.post('/api/users', [
 ], async (req, res) => {
   const { name, phone, location, groupId } = req.body;
   const id = randomUUID();
-  await query('INSERT INTO users (id, name, phone, location, group_id, status) VALUES (?, ?, ?, ?, ?, ?)', 
-    [id, name, phone, location, groupId || null, 'pending']);
+  await query('INSERT INTO users (id, name, phone, location, group_id, status) VALUES (?, ?, ?, ?, ?, ?)',
+    [id, name, phone ?? null, location, groupId || null, 'pending']);
   res.json({ id, name, status: 'pending' });
 });
 
 app.post('/api/payments', [
   body('userId').notEmpty(),
-  body('amount').isNumeric(),
+  body('amount').isInt({ gt: 0 }),
   body('officerId').notEmpty(),
   validate
 ], async (req, res) => {
@@ -280,8 +315,8 @@ app.post('/api/payments', [
 app.post('/api/audits', [body('userId').notEmpty(), validate], async (req, res) => {
   const { userId, mood, stockLevel, traffic, notes } = req.body;
   const id = randomUUID();
-  await query('INSERT INTO audits (id, user_id, mood, stock_level, traffic, notes) VALUES (?, ?, ?, ?, ?, ?)', 
-    [id, userId, mood, stockLevel, traffic, notes]);
+  await query('INSERT INTO audits (id, user_id, mood, stock_level, traffic, notes) VALUES (?, ?, ?, ?, ?, ?)',
+    [id, userId, mood ?? null, stockLevel ?? null, traffic ?? null, notes ?? null]);
   res.json({ success: true, id });
 });
 
@@ -297,7 +332,7 @@ app.post('/api/optimize-route', checkAi, async (req, res) => {
     const prompt = `As a Nigerian Credit Risk Specialist for Rill, optimize the collection route for today. 
 Merchants: ${JSON.stringify(merchants)}. Priority to 'urgent' and 'at-risk'. Output JSON with prioritizedIds and reasoning.`;
     const response = await ai.models.generateContent({
-      model: 'gemini-1.5-flash',
+      model: AI_MODEL,
       contents: prompt,
       config: {
         responseMimeType: 'application/json',
@@ -314,17 +349,23 @@ Merchants: ${JSON.stringify(merchants)}. Priority to 'urgent' and 'at-risk'. Out
         }
       }
     });
-    res.json(JSON.parse(response.text || '{}'));
+    // Guard against malformed/blocked model output so the client always gets a
+    // usable shape instead of a 500 from a thrown JSON.parse.
+    const parsed = safeJsonParse(response.text, { prioritizedIds: [], reasoning: '' });
+    res.json({
+      prioritizedIds: Array.isArray(parsed.prioritizedIds) ? parsed.prioritizedIds : [],
+      reasoning: typeof parsed.reasoning === 'string' ? parsed.reasoning : ''
+    });
 });
 
 app.post('/api/rebuttal', checkAi, async (req, res) => {
     const { merchantName, excuse } = req.body;
     const prompt = `Merchant ${merchantName} says: "${excuse}". Firm professional rebuttal, < 3 sentences, calm accountability.`;
     const response = await ai.models.generateContent({
-      model: 'gemini-1.5-flash',
+      model: AI_MODEL,
       contents: prompt
     });
-    res.json({ text: response.text });
+    res.json({ text: response.text || '' });
 });
 
 app.post('/api/risk-briefing', checkAi, async (req, res) => {
@@ -335,10 +376,10 @@ Merchant Status: ${JSON.stringify(merchants)}
 Provide a 3-sentence risk briefing highlighting any behavioral shifts or cluster-level trends.`;
 
     const response = await ai.models.generateContent({
-      model: 'gemini-1.5-flash',
+      model: AI_MODEL,
       contents: prompt
     });
-    res.json({ text: response.text });
+    res.json({ text: response.text || '' });
 });
 
 app.use((err, req, res, next) => {
