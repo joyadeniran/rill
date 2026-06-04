@@ -5,6 +5,8 @@ import { jest } from '@jest/globals';
 describe('Rill API Integration Tests', () => {
   let officerId;
   let userId;
+  let token;
+  const auth = () => ({ Authorization: `Bearer ${token}` });
 
   test('GET /health should return 200', async () => {
     const res = await request(app).get('/health');
@@ -12,7 +14,7 @@ describe('Rill API Integration Tests', () => {
     expect(res.body.status).toBe('ok');
   });
 
-  test('POST /api/auth/register should create an officer', async () => {
+  test('POST /api/auth/register should create an officer and return a token', async () => {
     const res = await request(app)
       .post('/api/auth/register')
       .send({
@@ -23,12 +25,15 @@ describe('Rill API Integration Tests', () => {
       });
     expect(res.status).toBe(200);
     expect(res.body.officer).toBeDefined();
+    expect(typeof res.body.token).toBe('string');
     officerId = res.body.officer.id;
+    token = res.body.token;
   });
 
   test('POST /api/users should create a user', async () => {
     const res = await request(app)
       .post('/api/users')
+      .set(auth())
       .send({
         name: 'Test Borrower',
         location: 'Test Market'
@@ -39,10 +44,9 @@ describe('Rill API Integration Tests', () => {
   });
 
   test('POST /api/payments should log a payment and update balance', async () => {
-    // First, give the user some balance manually or via a future disbursement endpoint
-    // For now, let's just test the endpoint logic
     const res = await request(app)
       .post('/api/payments')
+      .set(auth())
       .send({
         userId,
         amount: 1000,
@@ -56,6 +60,7 @@ describe('Rill API Integration Tests', () => {
   test('POST /api/audits should log an audit', async () => {
     const res = await request(app)
       .post('/api/audits')
+      .set(auth())
       .send({
         userId,
         mood: 'positive',
@@ -68,6 +73,7 @@ describe('Rill API Integration Tests', () => {
   test('POST /api/escalations should log an escalation', async () => {
     const res = await request(app)
       .post('/api/escalations')
+      .set(auth())
       .send({
         userId,
         reason: 'Refusal to pay'
@@ -77,7 +83,7 @@ describe('Rill API Integration Tests', () => {
   });
 
   test('GET /api/today should return a list of merchants', async () => {
-    const res = await request(app).get('/api/today');
+    const res = await request(app).get('/api/today').set(auth());
     expect(res.status).toBe(200);
     expect(Array.isArray(res.body)).toBe(true);
   });
@@ -101,7 +107,7 @@ describe('Rill API Integration Tests', () => {
     expect(res.status).toBe(401);
   });
 
-  test('Registered officer can log in and receive officer payload', async () => {
+  test('Registered officer can log in and receive officer payload + token', async () => {
     const email = `login-${Date.now()}@rill.com`;
     await request(app)
       .post('/api/auth/register')
@@ -113,11 +119,34 @@ describe('Rill API Integration Tests', () => {
     expect(res.body.officer).toBeDefined();
     expect(res.body.officer.email).toBe(email);
     expect(res.body.officer.password).toBeUndefined();
+    expect(typeof res.body.token).toBe('string');
+  });
+
+  test('Security: protected endpoint without a token returns 401', async () => {
+    const res = await request(app).get('/api/today');
+    expect(res.status).toBe(401);
+  });
+
+  test('Security: protected endpoint with a malformed token returns 401', async () => {
+    const res = await request(app)
+      .get('/api/today')
+      .set({ Authorization: 'Bearer not.a.realtoken' });
+    expect(res.status).toBe(401);
+  });
+
+  test('Security: a tampered token signature is rejected (401)', async () => {
+    const [bodyPart] = token.split('.');
+    const forged = `${bodyPart}.deadbeefsignature`;
+    const res = await request(app)
+      .get('/api/today')
+      .set({ Authorization: `Bearer ${forged}` });
+    expect(res.status).toBe(401);
   });
 
   test('Edge Case: Payment with negative amount should be rejected (400)', async () => {
     const res = await request(app)
       .post('/api/payments')
+      .set(auth())
       .send({ userId, amount: -500, officerId, method: 'cash' });
     expect(res.status).toBe(400);
   });
@@ -125,6 +154,7 @@ describe('Rill API Integration Tests', () => {
   test('Edge Case: Payment with zero amount should be rejected (400)', async () => {
     const res = await request(app)
       .post('/api/payments')
+      .set(auth())
       .send({ userId, amount: 0, officerId, method: 'cash' });
     expect(res.status).toBe(400);
   });
@@ -132,6 +162,7 @@ describe('Rill API Integration Tests', () => {
   test('Audit with only required field (no optional fields) should succeed', async () => {
     const res = await request(app)
       .post('/api/audits')
+      .set(auth())
       .send({ userId });
     expect(res.status).toBe(200);
     expect(res.body.success).toBe(true);
@@ -140,13 +171,14 @@ describe('Rill API Integration Tests', () => {
   test('POST /api/users without phone should succeed and default to pending', async () => {
     const res = await request(app)
       .post('/api/users')
+      .set(auth())
       .send({ name: 'No Phone Borrower', location: 'Market Square' });
     expect(res.status).toBe(200);
     expect(res.body.status).toBe('pending');
   });
 
   test('GET /api/today returns merchants with numeric balance and dailyInstallment', async () => {
-    const res = await request(app).get('/api/today');
+    const res = await request(app).get('/api/today').set(auth());
     expect(res.status).toBe(200);
     expect(Array.isArray(res.body)).toBe(true);
     for (const m of res.body) {

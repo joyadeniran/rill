@@ -1,5 +1,6 @@
 import React, { createContext, useContext, useMemo, useState } from 'react';
 import type { UserRole } from '../types';
+import { setAuthToken } from '../services/api';
 
 interface UserData {
   id: string;
@@ -26,6 +27,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   const role: UserRole = userData ? 'co' : 'onboarding';
 
   const logout = () => {
+    setAuthToken(null);
     setUserData(null);
   };
 
