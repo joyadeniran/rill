@@ -102,3 +102,36 @@ UNDEFINED BIND: did NOT throw -> rows: [ { id: '1', phone: null, notes: 'x' } ]
 5. **CI gate** — run `npm test` + `cd mobile && npx tsc --noEmit` on every PR; add `expo-doctor` to the Codemagic pipeline to catch dependency drift.
 6. **Crash reporting** — wire Sentry/Crashlytics into the new `ErrorBoundary` to capture production crashes with stack traces.
 7. **Render warm-keep** — a scheduled ping (or paid plan) to avoid 30–60s cold-start latency on the free tier.
+
+---
+
+## 6. Follow-up batch #2 (PR #2) — security & CI hardening
+
+Implemented the highest-priority items from §5.
+
+### Backend authentication (was: no auth on data endpoints)
+- Dependency-free **HMAC-SHA256 signed bearer tokens** (`signToken`/`verifyAuthToken`), 7-day TTL, signed with `AUTH_SECRET` (random per-process fallback when unset). Signature compared with `timingSafeEqual`.
+- `/api/auth/login` and `/api/auth/register` now return `{ officer, token }`.
+- New `requireAuth` middleware protects the mobile data endpoints: `/api/today`, `/api/users`, `/api/payments`, `/api/audits`, `/api/escalations`. `/health` and the auth routes stay public.
+- Tampered/expired/missing tokens → `401`.
+- **AI endpoints (`/optimize-route`, `/rebuttal`, `/risk-briefing`) deliberately left token-free** because the web dashboard (`src/services/gemini.ts`) calls them without a bearer token; protecting them would break the web app. They keep `checkAi`. Unifying web + mobile auth so these can be protected is a tracked follow-up.
+
+### Mobile client
+- `setAuthToken()` in `api.ts`; the token is attached as `Authorization: Bearer …` on every request. `AuthScreen` sets it on login/register; `AuthContext.logout` clears it.
+
+### CORS lockdown
+- `ALLOWED_ORIGINS` (comma-separated) enables a strict browser allowlist; unset = open (dev/static web). Native app unaffected (no Origin header).
+
+### CI gate
+- `.github/workflows/ci.yml` runs backend tests + mobile typecheck on every push/PR to `main`.
+
+### Config
+- `.env.example` documents `AUTH_SECRET`, `ALLOWED_ORIGINS`, `GEMINI_MODEL`; `render.yaml` adds `AUTH_SECRET` (`generateValue: true`).
+
+### Verification
+```
+Backend tests: 19 passed / 19   (+3 security tests: missing / malformed / tampered token → 401)
+Mobile typecheck: clean (tsc --noEmit exit 0)
+```
+
+> Note: the `officerId` field still travels in the `/api/payments` body. Now that `req.officer` is available from the verified token, a future change should derive it server-side and drop the client-supplied field. Left as-is here to keep the client contract stable within this batch.

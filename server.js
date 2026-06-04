@@ -5,7 +5,7 @@ import dotenv from 'dotenv';
 import { GoogleGenAI, Type } from '@google/genai';
 import Database from 'better-sqlite3';
 import pg from 'pg';
-import { randomUUID, scryptSync, timingSafeEqual } from 'crypto';
+import { randomUUID, scryptSync, timingSafeEqual, createHmac } from 'crypto';
 import { body, validationResult } from 'express-validator';
 
 import path from 'path';
@@ -17,7 +17,28 @@ const __dirname = path.dirname(__filename);
 dotenv.config();
 
 const app = express();
-app.use(cors());
+
+// Lock CORS to an allowlist when ALLOWED_ORIGINS is set (comma-separated).
+// The native mobile client sends no Origin header, so it is unaffected; this
+// only constrains browser-based callers (the web dashboard). Defaults to open
+// when unset so local/dev and the bundled static web app keep working.
+const allowedOrigins = (process.env.ALLOWED_ORIGINS || '')
+  .split(',')
+  .map((o) => o.trim())
+  .filter(Boolean);
+
+app.use(
+  cors(
+    allowedOrigins.length > 0
+      ? {
+          origin: (origin, callback) => {
+            if (!origin || allowedOrigins.includes(origin)) return callback(null, true);
+            return callback(new Error('Not allowed by CORS'));
+          }
+        }
+      : undefined
+  )
+);
 app.use(express.json());
 
 // Serve static files from the Vite build directory
@@ -104,6 +125,53 @@ function verifyPassword(password, storedPassword) {
   const storedBuffer = Buffer.from(storedHash, 'hex');
   return storedBuffer.length === derivedBuffer.length && timingSafeEqual(storedBuffer, derivedBuffer);
 }
+
+// --- AUTH TOKENS (dependency-free, HMAC-signed) ---
+// In production AUTH_SECRET must be set; otherwise a per-process random secret
+// is used (tokens stay valid for the life of the process, which is acceptable
+// for a single instance and fails safe by invalidating on restart).
+const AUTH_SECRET = process.env.AUTH_SECRET || randomUUID();
+const TOKEN_TTL_MS = 1000 * 60 * 60 * 24 * 7; // 7 days
+
+function base64url(input) {
+  return Buffer.from(input).toString('base64url');
+}
+
+function signToken(payload) {
+  const body = base64url(JSON.stringify(payload));
+  const sig = createHmac('sha256', AUTH_SECRET).update(body).digest('base64url');
+  return `${body}.${sig}`;
+}
+
+function createAuthToken(officer) {
+  return signToken({ sub: officer.id, email: officer.email, exp: Date.now() + TOKEN_TTL_MS });
+}
+
+function verifyAuthToken(token) {
+  if (typeof token !== 'string' || !token.includes('.')) return null;
+  const [body, sig] = token.split('.');
+  if (!body || !sig) return null;
+  const expected = createHmac('sha256', AUTH_SECRET).update(body).digest('base64url');
+  const sigBuf = Buffer.from(sig);
+  const expBuf = Buffer.from(expected);
+  if (sigBuf.length !== expBuf.length || !timingSafeEqual(sigBuf, expBuf)) return null;
+  try {
+    const payload = JSON.parse(Buffer.from(body, 'base64url').toString('utf8'));
+    if (!payload.exp || payload.exp < Date.now()) return null;
+    return payload;
+  } catch {
+    return null;
+  }
+}
+
+const requireAuth = (req, res, next) => {
+  const header = req.headers.authorization || '';
+  const token = header.startsWith('Bearer ') ? header.slice(7) : null;
+  const payload = token ? verifyAuthToken(token) : null;
+  if (!payload) return res.status(401).json({ error: 'Authentication required' });
+  req.officer = payload;
+  next();
+};
 
 // Initialize Schema
 const initDb = async () => {
@@ -230,9 +298,10 @@ app.post('/api/auth/register', [
   const id = randomUUID();
   try {
     const passwordHash = hashPassword(password);
-    await query('INSERT INTO officers (id, email, password, first_name, last_name) VALUES (?, ?, ?, ?, ?)', 
+    await query('INSERT INTO officers (id, email, password, first_name, last_name) VALUES (?, ?, ?, ?, ?)',
       [id, email, passwordHash, firstName, lastName]);
-    res.json({ officer: { id, email, firstName, lastName } });
+    const officer = { id, email, firstName, lastName };
+    res.json({ officer, token: createAuthToken(officer) });
   } catch (error) {
     res.status(400).json({ error: 'Registration failed' });
   }
@@ -251,13 +320,13 @@ app.post('/api/auth/login', [
       await query('UPDATE officers SET password = ? WHERE id = ?', [hashPassword(password), officer.id]);
     }
     const { password: _, ...safeOfficer } = officer;
-    res.json({ officer: safeOfficer });
+    res.json({ officer: safeOfficer, token: createAuthToken(safeOfficer) });
   } else {
     res.status(401).json({ error: 'Invalid credentials' });
   }
 });
 
-app.get('/api/today', async (req, res) => {
+app.get('/api/today', requireAuth, async (req, res) => {
   const { rows: users } = await query(`
     SELECT 
       id, name, phone, location, group_id as "groupId", 
@@ -282,7 +351,7 @@ app.get('/api/today', async (req, res) => {
   res.json(merchants);
 });
 
-app.post('/api/users', [
+app.post('/api/users', requireAuth, [
   body('name').notEmpty(),
   body('location').notEmpty(),
   validate
@@ -294,7 +363,7 @@ app.post('/api/users', [
   res.json({ id, name, status: 'pending' });
 });
 
-app.post('/api/payments', [
+app.post('/api/payments', requireAuth, [
   body('userId').notEmpty(),
   body('amount').isInt({ gt: 0 }),
   body('officerId').notEmpty(),
@@ -312,7 +381,7 @@ app.post('/api/payments', [
   res.json({ success: true, id });
 });
 
-app.post('/api/audits', [body('userId').notEmpty(), validate], async (req, res) => {
+app.post('/api/audits', requireAuth, [body('userId').notEmpty(), validate], async (req, res) => {
   const { userId, mood, stockLevel, traffic, notes } = req.body;
   const id = randomUUID();
   await query('INSERT INTO audits (id, user_id, mood, stock_level, traffic, notes) VALUES (?, ?, ?, ?, ?, ?)',
@@ -320,7 +389,7 @@ app.post('/api/audits', [body('userId').notEmpty(), validate], async (req, res) 
   res.json({ success: true, id });
 });
 
-app.post('/api/escalations', [body('userId').notEmpty(), body('reason').notEmpty(), validate], async (req, res) => {
+app.post('/api/escalations', requireAuth, [body('userId').notEmpty(), body('reason').notEmpty(), validate], async (req, res) => {
   const { userId, reason } = req.body;
   const id = randomUUID();
   await query('INSERT INTO escalations (id, user_id, reason) VALUES (?, ?, ?)', [id, userId, reason]);

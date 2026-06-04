@@ -19,6 +19,14 @@ const API_BASE_URL = process.env.EXPO_PUBLIC_API_BASE_URL || defaultApiBaseUrl;
 // surface a friendly error.
 const REQUEST_TIMEOUT_MS = 30000;
 
+// The bearer token for authenticated endpoints. Held in module scope so it can
+// be attached to every request without threading it through each call site.
+let authToken: string | null = null;
+
+export function setAuthToken(token: string | null) {
+  authToken = token;
+}
+
 async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
@@ -30,6 +38,7 @@ async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
       signal: controller.signal,
       headers: {
         'Content-Type': 'application/json',
+        ...(authToken ? { Authorization: `Bearer ${authToken}` } : {}),
         ...options.headers
       }
     });
@@ -66,6 +75,7 @@ export interface AuthResponse {
     firstName: string;
     lastName: string;
   };
+  token: string;
 }
 
 export async function login(email: string, password: string): Promise<AuthResponse> {

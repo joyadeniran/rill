@@ -9,7 +9,7 @@ import {
   TextInput,
   View
 } from 'react-native';
-import { login, register } from '../services/api';
+import { login, register, setAuthToken } from '../services/api';
 import { useAuth } from '../contexts/AuthContext';
 
 export function AuthScreen() {
@@ -31,6 +31,7 @@ export function AuthScreen() {
     try {
       if (isLogin) {
         const response = await login(email.trim(), password);
+        setAuthToken(response.token);
         setUserData({ ...response.officer, role: 'co' });
       } else {
         if (!firstName || !lastName) {
@@ -44,6 +45,7 @@ export function AuthScreen() {
           firstName: firstName.trim(),
           lastName: lastName.trim()
         });
+        setAuthToken(response.token);
         setUserData({ ...response.officer, role: 'co' });
       }
     } catch (error) {
