@@ -135,3 +135,24 @@ Mobile typecheck: clean (tsc --noEmit exit 0)
 ```
 
 > Note: the `officerId` field still travels in the `/api/payments` body. Now that `req.officer` is available from the verified token, a future change should derive it server-side and drop the client-supplied field. Left as-is here to keep the client contract stable within this batch.
+
+---
+
+## 7. Follow-up batch #3 (PR #3) — timezone correctness, server-trusted identity, web prod bug
+
+### Postgres timezone drift (was §5.3)
+- All schema timestamp columns changed from `TIMESTAMP` → **`TIMESTAMPTZ`** (`officers`, `users`, `payments`, `audits`, `escalations`). `TIMESTAMP` (no tz) silently dropped the `Z` on insert, shifting the `diffHrs` math in `/api/today` by the server's UTC offset and mis-classifying `internalStatus` (`urgent`/`at-risk`/`on-track`) in production. SQLite is unaffected (it stores the ISO text and `new Date()` parses it as UTC). *Note: `CREATE TABLE IF NOT EXISTS` does not alter pre-existing Postgres tables — a fresh DB (or a manual `ALTER COLUMN ... TYPE timestamptz`) is required to pick this up.*
+
+### Server-trusted officer identity
+- `/api/payments` now records the officer from the **verified token** (`req.officer.sub`) instead of the client-supplied `officerId`, which could be spoofed. The `body('officerId')` validator was dropped; the body value is only a backward-compat fallback. Returns `400` if no identity can be resolved.
+
+### Web dashboard production bug
+- `src/services/gemini.ts` had `API_BASE = 'http://localhost:3001/api'` hard-coded, which breaks the deployed dashboard. Changed to a same-origin relative `'/api'` (the Express server serves the web app from `dist`), overridable via `VITE_API_BASE`.
+
+### Verification
+```
+Backend tests:   19 passed / 19
+Web typecheck:   tsc --noEmit clean
+Web build:       vite build OK (exit 0)
+Mobile typecheck: clean
+```

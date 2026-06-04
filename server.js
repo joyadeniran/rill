@@ -182,7 +182,7 @@ const initDb = async () => {
       password TEXT NOT NULL,
       first_name TEXT,
       last_name TEXT,
-      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
     );
 
     CREATE TABLE IF NOT EXISTS users (
@@ -196,7 +196,7 @@ const initDb = async () => {
       daily_installment INTEGER DEFAULT 0,
       status TEXT DEFAULT 'pending',
       last_payment_date TEXT,
-      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
     );
 
     CREATE TABLE IF NOT EXISTS payments (
@@ -205,7 +205,7 @@ const initDb = async () => {
       amount INTEGER NOT NULL,
       method TEXT NOT NULL,
       officer_id TEXT NOT NULL,
-      timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      timestamp TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
     );
 
     CREATE TABLE IF NOT EXISTS audits (
@@ -215,14 +215,14 @@ const initDb = async () => {
       stock_level TEXT,
       traffic TEXT,
       notes TEXT,
-      timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      timestamp TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
     );
 
     CREATE TABLE IF NOT EXISTS escalations (
       id TEXT PRIMARY KEY,
       user_id TEXT NOT NULL,
       reason TEXT NOT NULL,
-      timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      timestamp TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
     );
   `;
   if (isPostgres) {
@@ -366,10 +366,14 @@ app.post('/api/users', requireAuth, [
 app.post('/api/payments', requireAuth, [
   body('userId').notEmpty(),
   body('amount').isInt({ gt: 0 }),
-  body('officerId').notEmpty(),
   validate
 ], async (req, res) => {
-  const { userId, amount, method, officerId } = req.body;
+  const { userId, amount, method } = req.body;
+  // Trust the authenticated officer from the verified token, not a
+  // client-supplied officerId (which could be spoofed). Fall back to the body
+  // only if the token has no subject, for backward compatibility.
+  const officerId = req.officer?.sub || req.body.officerId;
+  if (!officerId) return res.status(400).json({ error: 'Missing officer identity' });
   const id = randomUUID();
   const timestamp = new Date().toISOString();
   await runTransaction([
