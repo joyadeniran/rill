@@ -50,9 +50,13 @@ let pool;
 let sqlite;
 
 if (isPostgres) {
+  // SSL is required by managed providers like Render (default on). Set
+  // PGSSL=disable for a non-SSL Postgres (local/self-hosted) instead of failing
+  // with "The server does not support SSL connections".
+  const useSsl = process.env.PGSSL !== 'disable';
   pool = new pg.Pool({
     connectionString: process.env.DATABASE_URL,
-    ssl: { rejectUnauthorized: false }
+    ssl: useSsl ? { rejectUnauthorized: false } : false
   });
   console.log('Connected to PostgreSQL');
 } else {
@@ -227,10 +231,53 @@ const initDb = async () => {
   `;
   if (isPostgres) {
     await pool.query(schema);
+    await migratePostgresTimestamps();
   } else {
     sqlite.exec(schema);
   }
 };
+
+// Existing Postgres databases created before the TIMESTAMPTZ change still have
+// `timestamp without time zone` columns (CREATE TABLE IF NOT EXISTS does not
+// alter them). Convert any that remain so the /api/today date math is correct.
+// Idempotent and safe to run on every boot: it only touches columns whose type
+// is still `timestamp without time zone`, so once converted it is a no-op and
+// cannot double-shift values. The naive values are interpreted as UTC: the app
+// writes payment timestamps as UTC ISO strings (Postgres strips the `Z` when
+// storing into a tz-less column, keeping the UTC wall-clock), and Render's DB
+// session is UTC so the CURRENT_TIMESTAMP defaults are UTC too. Verified
+// end-to-end against Postgres 16 under UTC, America/New_York and Asia/Kolkata
+// sessions — the absolute instant is preserved in every case.
+const TIMESTAMP_COLUMNS = [
+  ['officers', 'created_at'],
+  ['users', 'created_at'],
+  ['payments', 'timestamp'],
+  ['audits', 'timestamp'],
+  ['escalations', 'timestamp']
+];
+
+async function migratePostgresTimestamps() {
+  for (const [table, column] of TIMESTAMP_COLUMNS) {
+    try {
+      const { rows } = await pool.query(
+        `SELECT data_type FROM information_schema.columns
+         WHERE table_name = $1 AND column_name = $2`,
+        [table, column]
+      );
+      if (rows[0]?.data_type === 'timestamp without time zone') {
+        await pool.query(
+          `ALTER TABLE ${table} ALTER COLUMN ${column} TYPE TIMESTAMPTZ
+           USING ${column} AT TIME ZONE 'UTC'`
+        );
+        console.log(`Migrated ${table}.${column} to TIMESTAMPTZ`);
+      }
+    } catch (err) {
+      // Non-fatal: log and continue so a single column failure does not block
+      // startup or poison the init promise.
+      console.error(`Timestamp migration skipped for ${table}.${column}:`, err.message);
+    }
+  }
+}
 
 // Memoize the init promise, but if it rejects (e.g. DB unreachable at cold
 // start) clear it so the NEXT request retries instead of every request being

@@ -156,3 +156,25 @@ Web typecheck:   tsc --noEmit clean
 Web build:       vite build OK (exit 0)
 Mobile typecheck: clean
 ```
+
+---
+
+## 8. Follow-up batch #4 (PR #4) — Postgres migration, verified against a real DB
+
+PR #3 changed the `CREATE TABLE` definitions but `CREATE TABLE IF NOT EXISTS` does **not** alter existing tables, so the **live Render DB still had the buggy `timestamp without time zone` columns** — the §7 fix wasn't actually in effect on the deployment.
+
+### What was added
+- **`migratePostgresTimestamps()`** — runs at init (Postgres only). Idempotent: it only converts columns whose type is still `timestamp without time zone` (checked via `information_schema`), so re-running is a no-op and can never double-shift. Each column failure is non-fatal and logged.
+- **`PGSSL=disable`** escape hatch for non-SSL Postgres (server.js previously hard-coded SSL on, which fails against a local/self-hosted DB).
+
+### The verification caught a real bug in the migration
+A first attempt converted with `AT TIME ZONE current_setting('TimeZone')`. Standing up a **real Postgres 16** and testing under a non-UTC session (`America/New_York`) showed it **shifted every payment timestamp by the server offset** (10:00Z → 14:00Z) — the exact bug class being fixed. Root cause: inserting a `…Z` ISO string into a tz-less column makes Postgres **strip** the zone and store the literal UTC wall-clock, so the correct conversion is `AT TIME ZONE 'UTC'`. Re-tested under UTC, `America/New_York`, and `Asia/Kolkata`: instant preserved in all three, idempotent, type converted.
+
+### Full app exercised against real Postgres (a first — tests previously only ran on SQLite)
+Booted `server.js` against a live Postgres 16 with a seeded legacy `payments` table and confirmed: `/health` reports postgres, register→token, user create, **payment derives officer from the token** (no `officerId` in body), `/api/today` returns the correct shape (validating the `?`→`$n` placeholder translation and the date math), unauthenticated `/api/today` → 401, and the **legacy `payments.timestamp` was migrated to `timestamptz`**.
+
+```
+Real Postgres 16 integration: 7/7 PASS
+Migration timezone matrix (UTC / New_York / Kolkata): instant preserved, idempotent — PASS
+SQLite suite: 19/19   |   node --check: OK
+```
