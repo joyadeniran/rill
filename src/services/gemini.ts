@@ -1,6 +1,9 @@
 import { Merchant, CheckInLog } from "../types";
 
-const API_BASE = 'http://localhost:3001/api';
+// The web dashboard is served same-origin by the Express server (from `dist`),
+// so default to a relative '/api'. Override with VITE_API_BASE for split
+// deployments. Previously hard-coded to localhost, which broke in production.
+const API_BASE = import.meta.env.VITE_API_BASE || '/api';
 
 export const getRouteOptimization = async (merchants: Merchant[]) => {
   const response = await fetch(`${API_BASE}/optimize-route`, {
