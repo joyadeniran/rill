@@ -108,6 +108,13 @@ export async function createUser(data: { name: string; phone: string; location: 
   });
 }
 
+export async function getUserHistory(userId: string) {
+  return request<{ 
+    payments: Array<{ amount: number; method: string; timestamp: string }>;
+    audits: Array<{ mood: string; stockLevel: string; traffic: string; notes: string; timestamp: string }>;
+  }>(`/users/${userId}/history`);
+}
+
 // --- ACTIONS ---
 
 export async function recordRepayment(data: { userId: string; amount: number; method: string; officerId: string }) {

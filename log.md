@@ -173,8 +173,33 @@ A first attempt converted with `AT TIME ZONE current_setting('TimeZone')`. Stand
 ### Full app exercised against real Postgres (a first — tests previously only ran on SQLite)
 Booted `server.js` against a live Postgres 16 with a seeded legacy `payments` table and confirmed: `/health` reports postgres, register→token, user create, **payment derives officer from the token** (no `officerId` in body), `/api/today` returns the correct shape (validating the `?`→`$n` placeholder translation and the date math), unauthenticated `/api/today` → 401, and the **legacy `payments.timestamp` was migrated to `timestamptz`**.
 
-```
-Real Postgres 16 integration: 7/7 PASS
-Migration timezone matrix (UTC / New_York / Kolkata): instant preserved, idempotent — PASS
-SQLite suite: 19/19   |   node --check: OK
-```
+---
+
+## 9. Follow-up batch #5 (PR #5) — Mobile hardening & spec completion
+
+Implemented the remaining production-readiness items from §1–§8 and fulfilled the core feature set from `RILL_SPEC.md`.
+
+### Mobile Production Hardening
+- **Asset Configuration:** Updated `app.json` with production paths for `icon`, `splash`, and `adaptiveIcon`. Added explicit iOS `bundleIdentifier` and Android `package`.
+- **Permissions:** Added `NSLocationWhenInUseUsageDescription` (iOS) and `ACCESS_FINE_LOCATION` (Android) to support route intelligence.
+- **Entry Point Fix:** Resolved a Metro bundler error (`Unable to resolve module ../../App`) by switching from `node_modules/expo/AppEntry.js` to a local `index.js` entry point.
+- **EAS & CD:** Configured `eas.json` with `production`, `preview`, and `development` channels.
+- **Quality Tools:** Integrated **ESLint** (Expo Universe) and **Prettier**.
+- **Testing:** Added **Jest** + **React Native Testing Library**; created `mobile/src/services/__tests__/api.test.ts`.
+
+### Feature Completion (RILL_SPEC.md)
+- **Call Action:** Integrated `react-native` `Linking` to allow COs to call merchants directly from the card list.
+- **User History:** 
+  - **Backend:** Added `GET /api/users/:id/history` returning unified payment + audit logs.
+  - **Mobile:** Implemented a new **History Modal** showing chronological activity for a specific borrower.
+- **AI Optimization:** Refined the `optimize-route` prompt to prioritize merchants by **balance owed** and **last payment recency** in addition to their internal status.
+- **UI UX:** Updated the merchant action row to be responsive (flex-wrap) and added a "Call" button with a high-contrast style.
+
+### Assets
+- Created placeholder icon/splash assets to enable local builds.
+- Successfully imported a user-supplied high-fidelity icon and propagated it to the splash and adaptive-icon slots.
+
+### Verification
+- `mobile/index.js` verified as a valid entry point.
+- `package.json` scripts (`lint`, `test`, `typecheck`) added and verified.
+- Backend history endpoint verified for cross-compatibility with the mobile service layer.

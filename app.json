@@ -1,0 +1,18 @@
+{
+  "expo": {
+    "extra": {
+      "eas": {
+        "projectId": "479cdb23-9805-4e2e-9423-afe67ddcb8ba"
+      }
+    },
+    "android": {
+      "package": "com.suppplya.rill"
+    },
+    "ios": {
+      "bundleIdentifier": "com.suppplya.rill",
+      "infoPlist": {
+        "ITSAppUsesNonExemptEncryption": false
+      }
+    }
+  }
+}

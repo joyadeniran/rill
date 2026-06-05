@@ -2,6 +2,7 @@ import React, { useEffect, useMemo, useState } from 'react';
 import {
   ActivityIndicator,
   Alert,
+  Linking,
   Modal,
   Pressable,
   RefreshControl,
@@ -19,12 +20,17 @@ import {
   recordAudit, 
   recordEscalation, 
   createUser,
+  getUserHistory,
   getAIRebuttal, 
   getRouteOptimization 
 } from '../services/api';
 import type { CheckInLog, Merchant } from '../types';
 
 type ChatMessage = { role: 'user' | 'ai'; text: string };
+type UserHistory = {
+  payments: Array<{ amount: number; method: string; timestamp: string }>;
+  audits: Array<{ mood: string; stockLevel: string; traffic: string; notes: string; timestamp: string }>;
+};
 
 const emptyCheckIn = {
   mood: 'positive' as CheckInLog['mood'],
@@ -48,6 +54,7 @@ export function FieldOfficerApp() {
   const [chatVisible, setChatVisible] = useState(false);
   const [escalateVisible, setEscalateVisible] = useState(false);
   const [addUserVisible, setAddUserVisible] = useState(false);
+  const [historyVisible, setHistoryVisible] = useState(false);
 
   // Forms
   const [checkInForm, setCheckInForm] = useState(emptyCheckIn);
@@ -58,6 +65,10 @@ export function FieldOfficerApp() {
   const [chatHistory, setChatHistory] = useState<ChatMessage[]>([]);
   const [chatMessage, setChatMessage] = useState('');
   const [chatLoading, setChatLoading] = useState(false);
+
+  // History
+  const [userHistory, setUserHistory] = useState<UserHistory | null>(null);
+  const [historyLoading, setHistoryLoading] = useState(false);
 
   const fetchData = async () => {
     setRefreshing(true);
@@ -129,6 +140,28 @@ export function FieldOfficerApp() {
       fetchData();
     } catch (error) {
       Alert.alert('Error', 'Failed to record payment');
+    }
+  };
+
+  const handleCall = (phone: string) => {
+    if (!phone) {
+      Alert.alert('Error', 'No phone number available for this merchant');
+      return;
+    }
+    Linking.openURL(`tel:${phone}`);
+  };
+
+  const fetchHistory = async (merchant: Merchant) => {
+    setHistoryVisible(true);
+    setHistoryLoading(true);
+    try {
+      const data = await getUserHistory(merchant.id);
+      setUserHistory(data);
+    } catch (error) {
+      Alert.alert('Error', 'Failed to fetch history');
+      setHistoryVisible(false);
+    } finally {
+      setHistoryLoading(false);
     }
   };
 
@@ -228,6 +261,9 @@ export function FieldOfficerApp() {
 
         {isSelected && (
           <View style={styles.actionsRow}>
+            <Pressable style={styles.callButton} onPress={() => handleCall(merchant.phone)}>
+              <Text style={styles.callButtonText}>Call</Text>
+            </Pressable>
             <Pressable style={styles.primaryButton} onPress={() => handleRepayment(merchant)}>
               <Text style={styles.primaryButtonText}>Log Payment</Text>
             </Pressable>
@@ -236,6 +272,9 @@ export function FieldOfficerApp() {
             </Pressable>
             <Pressable style={styles.actionButton} onPress={() => setEscalateVisible(true)}>
               <Text style={styles.escalateText}>Escalate</Text>
+            </Pressable>
+            <Pressable style={styles.actionButton} onPress={() => fetchHistory(merchant)}>
+              <Text style={styles.actionButtonText}>History</Text>
             </Pressable>
             <Pressable style={styles.actionButton} onPress={() => setChatVisible(true)}>
               <Text style={styles.actionButtonText}>AI</Text>
@@ -439,6 +478,46 @@ export function FieldOfficerApp() {
           </View>
         </SafeAreaView>
       </Modal>
+
+      {/* History Modal */}
+      <Modal visible={historyVisible} animationType="slide">
+        <SafeAreaView style={styles.modalShell}>
+          <View style={styles.modalHeader}>
+            <Text style={styles.modalTitle}>History: {selectedMerchant?.name}</Text>
+            <Pressable onPress={() => { setHistoryVisible(false); setUserHistory(null); }}><Text style={styles.closeText}>Close</Text></Pressable>
+          </View>
+          {historyLoading ? (
+            <ActivityIndicator size="large" style={{ marginTop: 50 }} />
+          ) : (
+            <ScrollView style={styles.modalContent}>
+              <Text style={styles.sectionTitle}>REPAYMENTS</Text>
+              {userHistory?.payments.length === 0 ? (
+                <Text style={styles.emptyText}>No payments recorded.</Text>
+              ) : (
+                userHistory?.payments.map((p, i) => (
+                  <View key={i} style={styles.historyItem}>
+                    <Text style={styles.historyMain}>N{p.amount.toLocaleString()} ({p.method})</Text>
+                    <Text style={styles.historySub}>{new Date(p.timestamp).toLocaleString()}</Text>
+                  </View>
+                ))
+              )}
+
+              <Text style={[styles.sectionTitle, { marginTop: 20 }]}>AUDITS</Text>
+              {userHistory?.audits.length === 0 ? (
+                <Text style={styles.emptyText}>No audits recorded.</Text>
+              ) : (
+                userHistory?.audits.map((a, i) => (
+                  <View key={i} style={styles.historyItem}>
+                    <Text style={styles.historyMain}>{a.mood.toUpperCase()} | Stock: {a.stockLevel} | Traffic: {a.traffic}</Text>
+                    {a.notes ? <Text style={styles.historyNotes}>{a.notes}</Text> : null}
+                    <Text style={styles.historySub}>{new Date(a.timestamp).toLocaleString()}</Text>
+                  </View>
+                ))
+              )}
+            </ScrollView>
+          )}
+        </SafeAreaView>
+      </Modal>
     </SafeAreaView>
   );
 }
@@ -481,10 +560,12 @@ const styles = StyleSheet.create({
   merchantStats: { flexDirection: 'row', justifyContent: 'space-between', backgroundColor: '#f8fafc', padding: 10, borderRadius: 12 },
   statLabel: { fontSize: 10, color: '#94a3b8', textTransform: 'uppercase', marginBottom: 2 },
   balanceValue: { fontSize: 14, fontWeight: '700', color: '#1e293b' },
-  actionsRow: { flexDirection: 'row', gap: 8, marginTop: 4 },
-  primaryButton: { flex: 2, backgroundColor: '#1e1b4b', borderRadius: 12, paddingVertical: 12, alignItems: 'center', justifyContent: 'center' },
+  actionsRow: { flexDirection: 'row', gap: 8, marginTop: 4, flexWrap: 'wrap' },
+  callButton: { flexBasis: '20%', backgroundColor: '#dcfce7', borderRadius: 12, paddingVertical: 12, alignItems: 'center', justifyContent: 'center', borderWidth: 1, borderColor: '#166534' },
+  callButtonText: { fontSize: 12, fontWeight: '700', color: '#166534' },
+  primaryButton: { flexBasis: '45%', backgroundColor: '#1e1b4b', borderRadius: 12, paddingVertical: 12, alignItems: 'center', justifyContent: 'center' },
   primaryButtonText: { color: '#fff', fontWeight: '700' },
-  actionButton: { flex: 1, backgroundColor: '#f1f5f9', borderRadius: 12, paddingVertical: 12, alignItems: 'center', justifyContent: 'center' },
+  actionButton: { flexBasis: '22%', backgroundColor: '#f1f5f9', borderRadius: 12, paddingVertical: 12, alignItems: 'center', justifyContent: 'center' },
   actionButtonText: { fontSize: 12, fontWeight: '600', color: '#475569' },
   escalateText: { fontSize: 12, fontWeight: '600', color: '#ef4444' },
   modalShell: { flex: 1, backgroundColor: '#fff' },
@@ -511,5 +592,10 @@ const styles = StyleSheet.create({
   aiText: { color: '#1e293b' },
   chatInputRow: { flexDirection: 'row', gap: 10, paddingVertical: 10 },
   sendButton: { backgroundColor: '#4f46e5', width: 50, borderRadius: 12, alignItems: 'center', justifyContent: 'center' },
-  sendButtonText: { color: '#fff', fontWeight: '700' }
+  sendButtonText: { color: '#fff', fontWeight: '700' },
+  historyItem: { paddingVertical: 12, borderBottomWidth: 1, borderBottomColor: '#f1f5f9' },
+  historyMain: { fontSize: 15, fontWeight: '700', color: '#1e293b' },
+  historySub: { fontSize: 12, color: '#94a3b8', marginTop: 4 },
+  historyNotes: { fontSize: 14, color: '#475569', fontStyle: 'italic', marginVertical: 4 },
+  emptyText: { fontSize: 14, color: '#94a3b8', textAlign: 'center', marginTop: 20 }
 });

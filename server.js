@@ -398,6 +398,19 @@ app.get('/api/today', requireAuth, async (req, res) => {
   res.json(merchants);
 });
 
+app.get('/api/users/:id/history', requireAuth, async (req, res) => {
+  const { id } = req.params;
+  const { rows: payments } = await query(
+    'SELECT amount, method, timestamp FROM payments WHERE user_id = ? ORDER BY timestamp DESC',
+    [id]
+  );
+  const { rows: audits } = await query(
+    'SELECT mood, stock_level as "stockLevel", traffic, notes, timestamp FROM audits WHERE user_id = ? ORDER BY timestamp DESC',
+    [id]
+  );
+  res.json({ payments, audits });
+});
+
 app.post('/api/users', requireAuth, [
   body('name').notEmpty(),
   body('location').notEmpty(),
@@ -450,7 +463,10 @@ app.post('/api/escalations', requireAuth, [body('userId').notEmpty(), body('reas
 app.post('/api/optimize-route', checkAi, async (req, res) => {
     const { merchants } = req.body;
     const prompt = `As a Nigerian Credit Risk Specialist for Rill, optimize the collection route for today. 
-Merchants: ${JSON.stringify(merchants)}. Priority to 'urgent' and 'at-risk'. Output JSON with prioritizedIds and reasoning.`;
+Merchants: ${JSON.stringify(merchants)}. 
+Priority to 'urgent' and 'at-risk' merchants. 
+Also consider 'highest balance owed' and 'longest time since last payment' as secondary priority factors.
+Output JSON with prioritizedIds and reasoning.`;
     const response = await ai.models.generateContent({
       model: AI_MODEL,
       contents: prompt,
