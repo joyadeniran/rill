@@ -13,7 +13,11 @@
     "test": "node --experimental-vm-modules node_modules/jest/bin/jest.js"
   },
   "jest": {
-    "transform": {}
+    "transform": {},
+    "testPathIgnorePatterns": [
+      "/node_modules/",
+      "/mobile/"
+    ]
   },
   "dependencies": {
     "@google/genai": "^1.29.0",
