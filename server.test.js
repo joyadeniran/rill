@@ -429,4 +429,65 @@ describe('Roles, disbursements & payment integrity', () => {
       .send({ status: 'vaporized' });
     expect(res.status).toBe(400);
   });
+
+  // --- Admin reads ---
+
+  test('GET /api/users requires admin (CO -> 403) and includes deactivated users', async () => {
+    const asCo = await request(app).get('/api/users').set(coAuth());
+    expect(asCo.status).toBe(403);
+
+    const asAdmin = await request(app).get('/api/users').set(adminAuth());
+    expect(asAdmin.status).toBe(200);
+    const deactivated = asAdmin.body.find((u) => u.id === merchantId);
+    expect(deactivated).toBeDefined();
+    expect(deactivated.status).toBe('deactivated');
+  });
+
+  test('GET /api/escalations is admin-only and returns logged escalations', async () => {
+    const created = await request(app)
+      .post('/api/users')
+      .set(coAuth())
+      .send({ name: 'Escalated Merchant', location: 'Oshodi' });
+    await request(app)
+      .post('/api/escalations')
+      .set(coAuth())
+      .send({ userId: created.body.id, reason: 'Refusal to pay' });
+
+    const asCo = await request(app).get('/api/escalations').set(coAuth());
+    expect(asCo.status).toBe(403);
+
+    const asAdmin = await request(app).get('/api/escalations').set(adminAuth());
+    expect(asAdmin.status).toBe(200);
+    const row = asAdmin.body.find((e) => e.userId === created.body.id);
+    expect(row).toBeDefined();
+    expect(row.reason).toBe('Refusal to pay');
+    expect(row.userName).toBe('Escalated Merchant');
+  });
+
+  // --- AI endpoints require auth ---
+
+  test('AI endpoints without a token -> 401', async () => {
+    for (const path of ['/api/optimize-route', '/api/rebuttal', '/api/risk-briefing']) {
+      const res = await request(app).post(path).send({});
+      expect(res.status).toBe(401);
+    }
+  });
+
+  // --- Rate limiting on auth routes ---
+
+  test('auth routes rate-limit repeated attempts -> 429', async () => {
+    process.env.AUTH_RATE_LIMIT = '3';
+    try {
+      let lastStatus = 0;
+      for (let i = 0; i < 5; i += 1) {
+        const res = await request(app)
+          .post('/api/auth/login')
+          .send({ email: 'brute@rill.com', password: `guess-${i}` });
+        lastStatus = res.status;
+      }
+      expect(lastStatus).toBe(429);
+    } finally {
+      delete process.env.AUTH_RATE_LIMIT;
+    }
+  });
 });

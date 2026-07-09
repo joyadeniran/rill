@@ -191,6 +191,34 @@ const requireRole = (role) => (req, res, next) => {
   next();
 };
 
+// Fixed-window rate limiter for the auth routes (brute-force guard).
+// Dependency-free and in-memory: fine for a single instance; revisit if Rill
+// ever runs multiple instances behind a load balancer.
+const authAttempts = new Map(); // ip -> { count, windowStart }
+const AUTH_RATE_WINDOW_MS = 10 * 60 * 1000;
+
+const authRateLimit = (req, res, next) => {
+  const limit = Number(process.env.AUTH_RATE_LIMIT || 30);
+  const now = Date.now();
+  const ip = req.ip || req.socket?.remoteAddress || 'unknown';
+  // Lazy pruning keeps the map bounded.
+  if (authAttempts.size > 10000) {
+    for (const [key, value] of authAttempts) {
+      if (now - value.windowStart > AUTH_RATE_WINDOW_MS) authAttempts.delete(key);
+    }
+  }
+  const entry = authAttempts.get(ip);
+  if (!entry || now - entry.windowStart > AUTH_RATE_WINDOW_MS) {
+    authAttempts.set(ip, { count: 1, windowStart: now });
+    return next();
+  }
+  entry.count += 1;
+  if (entry.count > limit) {
+    return res.status(429).json({ error: 'Too many attempts. Please try again later.' });
+  }
+  next();
+};
+
 // Initialize Schema
 const initDb = async () => {
   const schema = `
@@ -394,7 +422,7 @@ const validate = (req, res, next) => {
 // --- ENDPOINTS ---
 app.get('/health', (req, res) => res.json({ status: 'ok', db: isPostgres ? 'postgres' : 'sqlite' }));
 
-app.post('/api/auth/register', [
+app.post('/api/auth/register', authRateLimit, [
   body('email').isEmail(),
   body('password').isLength({ min: 6 }),
   body('firstName').notEmpty(),
@@ -423,7 +451,7 @@ app.post('/api/auth/register', [
   }
 });
 
-app.post('/api/auth/login', [
+app.post('/api/auth/login', authRateLimit, [
   body('email').isEmail(),
   body('password').notEmpty(),
   validate
@@ -449,7 +477,7 @@ app.post('/api/auth/login', [
 const SUPPLYA_API_BASE = () =>
   process.env.SUPPLYA_API_BASE || 'https://supplya-backend-3t2x.onrender.com/api/v1';
 
-app.post('/api/auth/admin-login', [
+app.post('/api/auth/admin-login', authRateLimit, [
   body('email').isEmail(),
   body('password').notEmpty(),
   validate
@@ -572,6 +600,28 @@ app.post('/api/disbursements', requireAuth, requireRole('admin'), [
   res.json({ success: true, id });
 });
 
+// Admin-only: full user list, including deactivated (unlike /api/today).
+app.get('/api/users', requireAuth, requireRole('admin'), async (req, res) => {
+  const { rows } = await query(`
+    SELECT
+      id, name, phone, location, group_id as "groupId",
+      total_owed as "totalOwed", balance, daily_installment as "dailyInstallment",
+      status, last_payment_date as "lastPaymentDate"
+    FROM users ORDER BY name
+  `);
+  res.json(rows);
+});
+
+// Admin-only: escalation feed ("admin visibility" per RILL_SPEC §8).
+app.get('/api/escalations', requireAuth, requireRole('admin'), async (req, res) => {
+  const { rows } = await query(`
+    SELECT e.id, e.user_id as "userId", u.name as "userName", e.reason, e.timestamp
+    FROM escalations e LEFT JOIN users u ON u.id = e.user_id
+    ORDER BY e.timestamp DESC
+  `);
+  res.json(rows);
+});
+
 // Admin-only: activate/deactivate a merchant.
 app.patch('/api/users/:id/status', requireAuth, requireRole('admin'), [
   body('status').isIn(['active', 'deactivated']),
@@ -648,7 +698,9 @@ app.post('/api/escalations', requireAuth, [body('userId').notEmpty(), body('reas
   res.json({ success: true, id });
 });
 
-app.post('/api/optimize-route', checkAi, async (req, res) => {
+// AI endpoints require auth: they spend Gemini quota. The mobile app already
+// sends its bearer token; the admin console sends its own after login.
+app.post('/api/optimize-route', requireAuth, checkAi, async (req, res) => {
     const { merchants } = req.body;
     const prompt = `As a Nigerian Credit Risk Specialist for Rill, optimize the collection route for today. 
 Merchants: ${JSON.stringify(merchants)}. 
@@ -682,7 +734,7 @@ Output JSON with prioritizedIds and reasoning.`;
     });
 });
 
-app.post('/api/rebuttal', checkAi, async (req, res) => {
+app.post('/api/rebuttal', requireAuth, checkAi, async (req, res) => {
     const { merchantName, excuse } = req.body;
     const prompt = `Merchant ${merchantName} says: "${excuse}". Firm professional rebuttal, < 3 sentences, calm accountability.`;
     const response = await ai.models.generateContent({
@@ -692,7 +744,7 @@ app.post('/api/rebuttal', checkAi, async (req, res) => {
     res.json({ text: response.text || '' });
 });
 
-app.post('/api/risk-briefing', checkAi, async (req, res) => {
+app.post('/api/risk-briefing', requireAuth, checkAi, async (req, res) => {
     const { logs, merchants } = req.body;
     const prompt = `Summarize the day's field activity for the Head of Credit.
 Field Logs: ${JSON.stringify(logs)}
@@ -707,8 +759,10 @@ Provide a 3-sentence risk briefing highlighting any behavioral shifts or cluster
 });
 
 app.use((err, req, res, next) => {
+  // Full detail server-side only; internals (paths, SQL, stack hints) must
+  // never reach a client.
   console.error(err.stack);
-  res.status(500).json({ error: 'Internal Server Error', message: err.message });
+  res.status(500).json({ error: 'Internal Server Error' });
 });
 
 const PORT = process.env.PORT || 3001;
