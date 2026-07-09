@@ -1,5 +1,7 @@
 # Rill — Production Readiness Audit & Plan
 
+> **STATUS UPDATE (2026-07-09):** Executed. F1–F3, F5–F12, F14, F15, F17(partial), F18, F19-adjacent all resolved — see `log.md` §10 for commits, verification evidence, and Joy's deploy checklist. F4 resolved via free Supabase Postgres (not paid Render). F13 (officer territories) and F16 (last_payment_date derivation) remain open by choice. Admin = existing Supplya admin via login proxy; supplya-backend untouched.
+
 **Date:** 2026-07-08 · **Auditor:** Claude (with Joy)
 **Context:** Rill is Supplya's collection-officer tool. Decision: **standalone pilot first** (own DB, no supplya-backend integration yet), audited to a **production-rollout bar**. Scope: CO mobile app + Express backend; web dashboards checked for security exposure only.
 

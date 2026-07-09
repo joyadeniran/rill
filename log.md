@@ -203,3 +203,76 @@ Implemented the remaining production-readiness items from §1–§8 and fulfille
 - `mobile/index.js` verified as a valid entry point.
 - `package.json` scripts (`lint`, `test`, `typecheck`) added and verified.
 - Backend history endpoint verified for cross-compatibility with the mobile service layer.
+
+---
+
+## 10. Production-readiness execution (2026-07-09) — Rill as Supplya's collection-officer tool
+
+Full audit in `PRODUCTION_READINESS.md`; this batch executed it. Decisions by
+Joy: standalone pilot (own DB), production bar, admin = existing Supplya admin
+account (zero supplya-backend changes), overpayment rejected, admin dashboard
+wired minimally, infra stays free (Supabase Postgres + Render free web).
+
+### Commits
+- `5e31d58` deps: expo-updates ~56.0.17 (SDK-56 line on an SDK-53 app — launch
+  breaker) → ~0.28.18 per expo 53.0.27 bundledNativeModules; pinned
+  react-test-renderer 19.0.0 (fixes ERESOLVE that would break CI's plain
+  `npm install`); added expo-secure-store + async-storage.
+- `869dc56` backend P0s (test-first, +19 tests): POST /api/disbursements
+  (admin-only, transactional, activates merchant — the missing core loop);
+  PATCH /api/users/:id/status; officers.role + requireRole (idempotent
+  migration verified against a legacy-schema DB); registration gated by
+  REGISTRATION_INVITE_CODE; POST /api/auth/admin-login proxies the existing
+  supplya-backend /auth/login and mints a Rill admin token only for
+  role=admin (password never trimmed); payments now validate user existence
+  (404), overpayment (400), method whitelist, and dedupe on idempotencyKey
+  via unique index (concurrent-safe).
+- `(mobile)` payment form (editable amount default installment-capped-at-
+  balance, cash/pos/transfer, confirmation dialog, in-flight disable);
+  idempotency keys on every payment; offline payment queue in AsyncStorage
+  (sync on refresh, per-merchant pending guard, server rejections surfaced);
+  session persisted in expo-secure-store with expiry check + 401 auto-logout;
+  crash guards (nullable audit mood `.toUpperCase()` TypeError, history array
+  shapes, numeric coercions); history shows disbursements.
+- `(admin+hardening)` real admin console replacing the Firebase/mock
+  prototype (Supplya admin sign-in, merchants table, disburse modal,
+  activate/deactivate, escalations feed); GET /api/users + /api/escalations
+  (admin-only); requireAuth on all three AI endpoints; fixed-window rate
+  limit on auth routes (AUTH_RATE_LIMIT, default 30/10min/IP); 500 handler
+  no longer leaks err.message; tsconfig self-contained (was extending
+  expo/tsconfig.base with no expo dep); firebase dep removed.
+- Infra: Supabase free Postgres provisioned (project `hootlycsbaxvtetrrpub`,
+  us-west-1, $0/mo, schema pre-applied and verified); render.yaml now takes
+  DATABASE_URL manually (session-pooler string) and drops the expiring
+  Render free DB.
+
+### Verification (final tree)
+```
+Backend:  42/42 tests green (incl. legacy-DB migration run)
+Mobile:   tsc --noEmit exit 0 · jest green
+Web:      tsc --noEmit exit 0
+Diff:     re-read against supplya invariants — no req.body mass-assign, no
+          password trim, no client-trusted amounts, no supplya-backend edits
+```
+
+### Joy action items (deploy)
+1. Supabase dashboard → Project Settings → Database → get/reset the DB
+   password; build the session-pooler DATABASE_URL (comment in render.yaml).
+2. Render dashboard → set DATABASE_URL; confirm REGISTRATION_INVITE_CODE
+   generated; share it with COs out-of-band.
+3. If the Render service is NOT in Oregon, say so — the Supabase project can
+   be recreated free in a closer region.
+4. Old Render DB: take a final dump if any pilot data matters (free DBs get
+   deleted on expiry).
+5. Rebuild the APK (deps changed): codemagic or `eas build`. Update the
+   placeholder email in codemagic.yaml publishing block.
+
+### Known residual limitations (accepted, documented)
+- Concurrent payments to the same merchant can race the balance check
+  (single-CO-per-merchant makes this unlikely; revisit with SELECT FOR UPDATE
+  if officer territories overlap).
+- Rate limiter and auth tokens are in-memory/stateless per instance — fine on
+  a single Render instance; revisit before horizontal scaling.
+- No payment reversal endpoint yet (admin correction path) — next batch.
+- Render free web cold starts (30-60s) remain; mobile handles with 30s
+  timeout + retry + offline queue. Consider an uptime ping.
