@@ -276,3 +276,9 @@ Diff:     re-read against supplya invariants — no req.body mass-assign, no
 - No payment reversal endpoint yet (admin correction path) — next batch.
 - Render free web cold starts (30-60s) remain; mobile handles with 30s
   timeout + retry + offline queue. Consider an uptime ping.
+
+### CI fix (post-merge)
+- Root `npm test` collected `mobile/**/api.test.ts` (TS, unparseable by root
+  jest) → CI "Backend tests" red. Added `/mobile/` to root jest
+  `testPathIgnorePatterns`. Reproduced red, verified green with the exact CI
+  command. Mobile tests still run via `cd mobile && jest` (jest-expo).
