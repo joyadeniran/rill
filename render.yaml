@@ -16,6 +16,10 @@ services:
         sync: false # Must be set manually in Render dashboard
       - key: AUTH_SECRET
         generateValue: true # Stable signed-token secret across restarts
+      - key: REGISTRATION_INVITE_CODE
+        generateValue: true # CO registration gate; read it in the dashboard to invite officers
+      - key: SUPPLYA_API_BASE
+        value: https://supplya-backend-3t2x.onrender.com/api/v1
 
 databases:
   - name: rill-db

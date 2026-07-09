@@ -148,7 +148,12 @@ function signToken(payload) {
 }
 
 function createAuthToken(officer) {
-  return signToken({ sub: officer.id, email: officer.email, exp: Date.now() + TOKEN_TTL_MS });
+  return signToken({
+    sub: officer.id,
+    email: officer.email,
+    role: officer.role || 'co',
+    exp: Date.now() + TOKEN_TTL_MS
+  });
 }
 
 function verifyAuthToken(token) {
@@ -177,6 +182,15 @@ const requireAuth = (req, res, next) => {
   next();
 };
 
+// Role check on top of requireAuth. The role lives in the signed token payload,
+// so it cannot be forged client-side. Admin tokens are minted only via the
+// Supplya admin-login proxy (or a future admin-provisioning path) — Rill has no
+// self-service route to an admin role.
+const requireRole = (role) => (req, res, next) => {
+  if (req.officer?.role !== role) return res.status(403).json({ error: 'Forbidden' });
+  next();
+};
+
 // Initialize Schema
 const initDb = async () => {
   const schema = `
@@ -186,6 +200,7 @@ const initDb = async () => {
       password TEXT NOT NULL,
       first_name TEXT,
       last_name TEXT,
+      role TEXT DEFAULT 'co',
       created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
     );
 
@@ -208,6 +223,16 @@ const initDb = async () => {
       user_id TEXT NOT NULL,
       amount INTEGER NOT NULL,
       method TEXT NOT NULL,
+      officer_id TEXT NOT NULL,
+      idempotency_key TEXT,
+      timestamp TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+    );
+
+    CREATE TABLE IF NOT EXISTS disbursements (
+      id TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL,
+      amount INTEGER NOT NULL,
+      daily_installment INTEGER NOT NULL,
       officer_id TEXT NOT NULL,
       timestamp TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
     );
@@ -235,7 +260,41 @@ const initDb = async () => {
   } else {
     sqlite.exec(schema);
   }
+  await migrateSchemaAdditions();
 };
+
+// Columns added after first deploy. CREATE TABLE IF NOT EXISTS does not alter
+// existing tables, so pre-existing databases (SQLite file or live Postgres)
+// need explicit, idempotent ALTERs. Same pattern as migratePostgresTimestamps:
+// check first, alter only when missing, never fail the boot on one column.
+async function migrateSchemaAdditions() {
+  const additions = [
+    ['officers', 'role', "TEXT DEFAULT 'co'"],
+    ['payments', 'idempotency_key', 'TEXT']
+  ];
+  for (const [table, column, type] of additions) {
+    try {
+      if (isPostgres) {
+        await pool.query(`ALTER TABLE ${table} ADD COLUMN IF NOT EXISTS ${column} ${type}`);
+      } else {
+        const cols = sqlite.prepare(`PRAGMA table_info(${table})`).all();
+        if (!cols.some((c) => c.name === column)) {
+          sqlite.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${type}`);
+        }
+      }
+    } catch (err) {
+      console.error(`Schema addition skipped for ${table}.${column}:`, err.message);
+    }
+  }
+  // Unique index enforces idempotency even under concurrent duplicates.
+  // Both SQLite and Postgres allow multiple NULLs in a unique index, so
+  // legacy rows (no key) are unaffected.
+  try {
+    await query('CREATE UNIQUE INDEX IF NOT EXISTS idx_payments_idempotency_key ON payments(idempotency_key)');
+  } catch (err) {
+    console.error('Idempotency index creation skipped:', err.message);
+  }
+}
 
 // Existing Postgres databases created before the TIMESTAMPTZ change still have
 // `timestamp without time zone` columns (CREATE TABLE IF NOT EXISTS does not
@@ -341,13 +400,23 @@ app.post('/api/auth/register', [
   body('firstName').notEmpty(),
   validate
 ], async (req, res) => {
+  // Registration is invite-gated in production (REGISTRATION_INVITE_CODE set
+  // via render.yaml). Without the gate, anyone who finds the URL could mint a
+  // CO account and read/write the merchant book. When the env is unset (local
+  // dev), registration stays open.
+  const inviteGate = process.env.REGISTRATION_INVITE_CODE;
+  if (inviteGate && req.body.inviteCode !== inviteGate) {
+    return res.status(403).json({ error: 'A valid invite code is required to register' });
+  }
   const { email, password, firstName, lastName } = req.body;
   const id = randomUUID();
   try {
     const passwordHash = hashPassword(password);
-    await query('INSERT INTO officers (id, email, password, first_name, last_name) VALUES (?, ?, ?, ?, ?)',
-      [id, email, passwordHash, firstName, lastName]);
-    const officer = { id, email, firstName, lastName };
+    // Self-registration always creates a CO. Admin authority comes only from
+    // the Supplya admin-login proxy below — never from this route.
+    await query('INSERT INTO officers (id, email, password, first_name, last_name, role) VALUES (?, ?, ?, ?, ?, ?)',
+      [id, email, passwordHash, firstName, lastName, 'co']);
+    const officer = { id, email, firstName, lastName, role: 'co' };
     res.json({ officer, token: createAuthToken(officer) });
   } catch (error) {
     res.status(400).json({ error: 'Registration failed' });
@@ -360,7 +429,7 @@ app.post('/api/auth/login', [
   validate
 ], async (req, res) => {
   const { email, password } = req.body;
-  const { rows } = await query('SELECT id, email, password, first_name as "firstName", last_name as "lastName" FROM officers WHERE email = ?', [email]);
+  const { rows } = await query('SELECT id, email, password, first_name as "firstName", last_name as "lastName", role FROM officers WHERE email = ?', [email]);
   const officer = rows[0];
   if (officer && verifyPassword(password, officer.password)) {
     if (!isHashedPassword(officer.password)) {
@@ -371,6 +440,59 @@ app.post('/api/auth/login', [
   } else {
     res.status(401).json({ error: 'Invalid credentials' });
   }
+});
+
+// Admin sign-in delegates entirely to the existing Supplya backend — Rill
+// stores no admin credentials and supplya-backend is not modified in any way
+// (Rill acts as a plain API client). The password is forwarded exactly as
+// received: never trim or transform passwords (supplya CLAUDE.md Rule 8).
+const SUPPLYA_API_BASE = () =>
+  process.env.SUPPLYA_API_BASE || 'https://supplya-backend-3t2x.onrender.com/api/v1';
+
+app.post('/api/auth/admin-login', [
+  body('email').isEmail(),
+  body('password').notEmpty(),
+  validate
+], async (req, res) => {
+  const { email, password } = req.body;
+
+  let upstream;
+  try {
+    const controller = new AbortController();
+    // Render free-tier cold starts can take 30-60s.
+    const timer = setTimeout(() => controller.abort(), 45000);
+    try {
+      upstream = await fetch(`${SUPPLYA_API_BASE()}/auth/login`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email, password }),
+        signal: controller.signal
+      });
+    } finally {
+      clearTimeout(timer);
+    }
+  } catch {
+    return res.status(502).json({ error: 'Could not reach Supplya to verify credentials. Please retry.' });
+  }
+
+  const data = await upstream.json().catch(() => null);
+  if (!upstream.ok || !data?.status || !data?.data) {
+    return res.status(401).json({ error: 'Invalid credentials' });
+  }
+  // Authority = the role Supplya's server asserts for these credentials.
+  // Only the supplya "admin" role maps to Rill admin.
+  if (data.data.role !== 'admin') {
+    return res.status(403).json({ error: 'This account is not a Supplya admin' });
+  }
+
+  const officer = {
+    id: `supplya:${data.data._id}`,
+    email: data.data.email,
+    firstName: data.data.firstName,
+    lastName: data.data.lastName,
+    role: 'admin'
+  };
+  res.json({ officer, token: createAuthToken(officer) });
 });
 
 app.get('/api/today', requireAuth, async (req, res) => {
@@ -408,7 +530,11 @@ app.get('/api/users/:id/history', requireAuth, async (req, res) => {
     'SELECT mood, stock_level as "stockLevel", traffic, notes, timestamp FROM audits WHERE user_id = ? ORDER BY timestamp DESC',
     [id]
   );
-  res.json({ payments, audits });
+  const { rows: disbursements } = await query(
+    'SELECT amount, daily_installment as "dailyInstallment", timestamp FROM disbursements WHERE user_id = ? ORDER BY timestamp DESC',
+    [id]
+  );
+  res.json({ payments, audits, disbursements });
 });
 
 app.post('/api/users', requireAuth, [
@@ -423,25 +549,87 @@ app.post('/api/users', requireAuth, [
   res.json({ id, name, status: 'pending' });
 });
 
+// Admin-only: put money on a merchant's book. This is the only path that
+// increases total_owed/balance and the only path to status 'active'.
+app.post('/api/disbursements', requireAuth, requireRole('admin'), [
+  body('userId').notEmpty(),
+  body('amount').isInt({ gt: 0 }),
+  body('dailyInstallment').isInt({ gt: 0 }),
+  validate
+], async (req, res) => {
+  const { userId, amount, dailyInstallment } = req.body;
+  const { rows } = await query('SELECT id FROM users WHERE id = ?', [userId]);
+  if (!rows[0]) return res.status(404).json({ error: 'User not found' });
+
+  const id = randomUUID();
+  const timestamp = new Date().toISOString();
+  await runTransaction([
+    { sql: 'INSERT INTO disbursements (id, user_id, amount, daily_installment, officer_id, timestamp) VALUES (?, ?, ?, ?, ?, ?)',
+      params: [id, userId, amount, dailyInstallment, req.officer.sub, timestamp] },
+    { sql: "UPDATE users SET total_owed = total_owed + ?, balance = balance + ?, daily_installment = ?, status = 'active' WHERE id = ?",
+      params: [amount, amount, dailyInstallment, userId] }
+  ]);
+  res.json({ success: true, id });
+});
+
+// Admin-only: activate/deactivate a merchant.
+app.patch('/api/users/:id/status', requireAuth, requireRole('admin'), [
+  body('status').isIn(['active', 'deactivated']),
+  validate
+], async (req, res) => {
+  const { rows } = await query('SELECT id FROM users WHERE id = ?', [req.params.id]);
+  if (!rows[0]) return res.status(404).json({ error: 'User not found' });
+  await query('UPDATE users SET status = ? WHERE id = ?', [req.body.status, req.params.id]);
+  res.json({ success: true });
+});
+
 app.post('/api/payments', requireAuth, [
   body('userId').notEmpty(),
   body('amount').isInt({ gt: 0 }),
+  body('method').optional().isIn(['cash', 'pos', 'transfer']),
   validate
 ], async (req, res) => {
-  const { userId, amount, method } = req.body;
+  const { userId, amount, method, idempotencyKey } = req.body;
   // Trust the authenticated officer from the verified token, not a
   // client-supplied officerId (which could be spoofed). Fall back to the body
   // only if the token has no subject, for backward compatibility.
   const officerId = req.officer?.sub || req.body.officerId;
   if (!officerId) return res.status(400).json({ error: 'Missing officer identity' });
+
+  // The ledger, not the client, is the authority on what can be collected.
+  const { rows: users } = await query('SELECT id, balance FROM users WHERE id = ?', [userId]);
+  const user = users[0];
+  if (!user) return res.status(404).json({ error: 'User not found' });
+  if (amount > Number(user.balance)) {
+    return res.status(400).json({ error: 'Amount exceeds outstanding balance' });
+  }
+
+  // Idempotency: a retry of a request that already succeeded (e.g. the client
+  // timed out after the server committed) must not decrement the balance a
+  // second time. Fast path checks for an existing record; the unique index on
+  // idempotency_key closes the concurrent-duplicate race below.
+  if (idempotencyKey) {
+    const { rows: existing } = await query('SELECT id FROM payments WHERE idempotency_key = ?', [idempotencyKey]);
+    if (existing[0]) return res.json({ success: true, id: existing[0].id, duplicate: true });
+  }
+
   const id = randomUUID();
   const timestamp = new Date().toISOString();
-  await runTransaction([
-    { sql: 'INSERT INTO payments (id, user_id, amount, method, officer_id, timestamp) VALUES (?, ?, ?, ?, ?, ?)', 
-      params: [id, userId, amount, method || 'cash', officerId, timestamp] },
-    { sql: 'UPDATE users SET balance = balance - ?, last_payment_date = ? WHERE id = ?', 
-      params: [amount, timestamp.split('T')[0], userId] }
-  ]);
+  try {
+    await runTransaction([
+      { sql: 'INSERT INTO payments (id, user_id, amount, method, officer_id, timestamp, idempotency_key) VALUES (?, ?, ?, ?, ?, ?, ?)',
+        params: [id, userId, amount, method || 'cash', officerId, timestamp, idempotencyKey ?? null] },
+      { sql: 'UPDATE users SET balance = balance - ?, last_payment_date = ? WHERE id = ?',
+        params: [amount, timestamp.split('T')[0], userId] }
+    ]);
+  } catch (err) {
+    // Concurrent duplicate hit the unique index: surface the original result.
+    if (idempotencyKey && /unique|duplicate/i.test(err.message || '')) {
+      const { rows: existing } = await query('SELECT id FROM payments WHERE idempotency_key = ?', [idempotencyKey]);
+      if (existing[0]) return res.json({ success: true, id: existing[0].id, duplicate: true });
+    }
+    throw err;
+  }
   res.json({ success: true, id });
 });
 
