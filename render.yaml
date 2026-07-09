@@ -8,15 +8,19 @@ services:
     envVars:
       - key: NODE_ENV
         value: production
+      # Supabase free Postgres (project ref: hootlycsbaxvtetrrpub, us-west-1).
+      # Render free Postgres expires and gets deleted; Supabase free does not.
+      # Set manually in the Render dashboard using the SESSION POOLER string
+      # (IPv4-compatible):
+      #   postgresql://postgres.hootlycsbaxvtetrrpub:<DB_PASSWORD>@aws-0-us-west-1.pooler.supabase.com:5432/postgres
+      # Get/reset <DB_PASSWORD> in Supabase: Project Settings -> Database.
       - key: DATABASE_URL
-        fromDatabase:
-          name: rill-db
-          property: connectionString
+        sync: false
       - key: GEMINI_API_KEY
         sync: false # Must be set manually in Render dashboard
       - key: AUTH_SECRET
         generateValue: true # Stable signed-token secret across restarts
-
-databases:
-  - name: rill-db
-    plan: free
+      - key: REGISTRATION_INVITE_CODE
+        generateValue: true # CO registration gate; read it in the dashboard to invite officers
+      - key: SUPPLYA_API_BASE
+        value: https://supplya-backend-3t2x.onrender.com/api/v1
