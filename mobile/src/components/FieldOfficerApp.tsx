@@ -14,23 +14,30 @@ import {
   View
 } from 'react-native';
 import { useAuth } from '../contexts/AuthContext';
-import { 
-  getTodayRoute, 
-  recordRepayment, 
-  recordAudit, 
-  recordEscalation, 
+import {
+  getTodayRoute,
+  recordRepayment,
+  recordAudit,
+  recordEscalation,
   createUser,
   getUserHistory,
-  getAIRebuttal, 
-  getRouteOptimization 
+  getAIRebuttal,
+  getRouteOptimization,
+  isNetworkError,
+  newIdempotencyKey,
+  type PaymentMethod
 } from '../services/api';
+import { enqueuePayment, flushQueue, hasPendingFor, pendingCount } from '../services/paymentQueue';
 import type { CheckInLog, Merchant } from '../types';
 
 type ChatMessage = { role: 'user' | 'ai'; text: string };
 type UserHistory = {
   payments: Array<{ amount: number; method: string; timestamp: string }>;
-  audits: Array<{ mood: string; stockLevel: string; traffic: string; notes: string; timestamp: string }>;
+  audits: Array<{ mood: string | null; stockLevel: string | null; traffic: string | null; notes: string | null; timestamp: string }>;
+  disbursements: Array<{ amount: number; dailyInstallment: number; timestamp: string }>;
 };
+
+const PAYMENT_METHODS: PaymentMethod[] = ['cash', 'pos', 'transfer'];
 
 const emptyCheckIn = {
   mood: 'positive' as CheckInLog['mood'],
@@ -55,6 +62,15 @@ export function FieldOfficerApp() {
   const [escalateVisible, setEscalateVisible] = useState(false);
   const [addUserVisible, setAddUserVisible] = useState(false);
   const [historyVisible, setHistoryVisible] = useState(false);
+  const [payVisible, setPayVisible] = useState(false);
+
+  // Payment form. The idempotency key is minted when the modal opens and used
+  // for that one logical payment (and any retries of it, incl. offline queue).
+  const [payAmount, setPayAmount] = useState('');
+  const [payMethod, setPayMethod] = useState<PaymentMethod>('cash');
+  const [payKey, setPayKey] = useState('');
+  const [paySubmitting, setPaySubmitting] = useState(false);
+  const [pendingSync, setPendingSync] = useState(0);
 
   // Forms
   const [checkInForm, setCheckInForm] = useState(emptyCheckIn);
@@ -73,10 +89,20 @@ export function FieldOfficerApp() {
   const fetchData = async () => {
     setRefreshing(true);
     try {
+      // Push any offline-queued payments first so the route reflects them.
+      const flushed = await flushQueue();
+      if (flushed.rejected.length > 0) {
+        Alert.alert(
+          'Some queued payments were rejected',
+          `These did NOT count:\n${flushed.rejected.join('\n')}`
+        );
+      }
+      setPendingSync(flushed.remaining);
       const data = await getTodayRoute();
       setMerchants(data);
     } catch (error) {
-      Alert.alert('Error', 'Failed to fetch today\'s route');
+      Alert.alert('Error', "Failed to fetch today's route");
+      pendingCount().then(setPendingSync).catch(() => {});
     } finally {
       setRefreshing(false);
     }
@@ -118,29 +144,85 @@ export function FieldOfficerApp() {
     };
   }, [merchants, routeOrder]);
 
-  const handleRepayment = async (merchant: Merchant) => {
+  const openPayment = async (merchant: Merchant) => {
     const balance = Number(merchant.balance ?? 0);
-    const amount = Number(merchant.dailyInstallment ?? 0);
     if (balance <= 0) {
       Alert.alert('No balance', 'This merchant has no outstanding balance.');
       return;
     }
-    if (amount <= 0) {
-      Alert.alert('No installment', 'This merchant has no daily installment set.');
+    if (await hasPendingFor(merchant.id)) {
+      Alert.alert(
+        'Payment pending sync',
+        'A payment for this merchant is already queued. Pull to refresh to sync it before recording another.'
+      );
       return;
     }
-    try {
-      await recordRepayment({
-        userId: merchant.id,
-        amount,
-        method: 'cash',
-        officerId: userData?.id ?? 'co'
-      });
-      Alert.alert('Success', `Recorded payment of NGN ${amount.toLocaleString()}`);
-      fetchData();
-    } catch (error) {
-      Alert.alert('Error', 'Failed to record payment');
+    const installment = Number(merchant.dailyInstallment ?? 0);
+    // Default to the daily installment, capped at what is actually owed.
+    const suggested = Math.min(installment > 0 ? installment : balance, balance);
+    setPayAmount(String(suggested));
+    setPayMethod('cash');
+    setPayKey(newIdempotencyKey());
+    setPayVisible(true);
+  };
+
+  const submitPayment = () => {
+    if (!selectedMerchant || paySubmitting) return;
+    const merchant = selectedMerchant;
+    const balance = Number(merchant.balance ?? 0);
+    const amount = parseInt(payAmount, 10);
+
+    if (!Number.isInteger(amount) || amount <= 0) {
+      Alert.alert('Invalid amount', 'Enter a whole number greater than zero.');
+      return;
     }
+    if (amount > balance) {
+      Alert.alert('Too much', `Amount exceeds outstanding balance (NGN ${balance.toLocaleString()}).`);
+      return;
+    }
+
+    // Explicit confirmation before any money write.
+    Alert.alert(
+      'Confirm payment',
+      `Record NGN ${amount.toLocaleString()} (${payMethod}) from ${merchant.name}?`,
+      [
+        { text: 'Cancel', style: 'cancel' },
+        {
+          text: 'Record',
+          onPress: async () => {
+            setPaySubmitting(true);
+            const payment = { userId: merchant.id, amount, method: payMethod, idempotencyKey: payKey };
+            try {
+              await recordRepayment(payment);
+              setPayVisible(false);
+              Alert.alert('Success', `Recorded NGN ${amount.toLocaleString()} from ${merchant.name}`);
+              fetchData();
+            } catch (error) {
+              if (isNetworkError(error)) {
+                // Can't reach the server: queue it. The idempotency key makes
+                // the eventual sync safe even if the original request landed.
+                const count = await enqueuePayment({
+                  ...payment,
+                  merchantName: merchant.name,
+                  queuedAt: new Date().toISOString()
+                });
+                setPendingSync(count);
+                setPayVisible(false);
+                Alert.alert(
+                  'Saved offline',
+                  'No connection — the payment is queued and will sync when you refresh with signal.'
+                );
+              } else {
+                const message = error instanceof Error ? error.message : 'Failed to record payment';
+                Alert.alert('Not recorded', message);
+              }
+            } finally {
+              setPaySubmitting(false);
+            }
+          }
+        }
+      ]
+    );
   };
 
   const handleCall = (phone: string) => {
@@ -264,7 +346,7 @@ export function FieldOfficerApp() {
             <Pressable style={styles.callButton} onPress={() => handleCall(merchant.phone)}>
               <Text style={styles.callButtonText}>Call</Text>
             </Pressable>
-            <Pressable style={styles.primaryButton} onPress={() => handleRepayment(merchant)}>
+            <Pressable style={styles.primaryButton} onPress={() => openPayment(merchant)}>
               <Text style={styles.primaryButtonText}>Log Payment</Text>
             </Pressable>
             <Pressable style={styles.actionButton} onPress={() => setCheckInVisible(true)}>
@@ -306,6 +388,14 @@ export function FieldOfficerApp() {
         contentContainerStyle={styles.content}
         refreshControl={<RefreshControl refreshing={refreshing} onRefresh={fetchData} />}
       >
+        {pendingSync > 0 && (
+          <View style={styles.syncBanner}>
+            <Text style={styles.syncBannerText}>
+              {pendingSync} payment{pendingSync > 1 ? 's' : ''} waiting to sync — pull to refresh when you have signal.
+            </Text>
+          </View>
+        )}
+
         <Pressable style={styles.intelCard} onPress={optimizeRoute} disabled={routeLoading}>
           <Text style={styles.intelTitle}>Route Intelligence</Text>
           {routeLoading ? (
@@ -373,6 +463,54 @@ export function FieldOfficerApp() {
             />
             <Pressable style={styles.primaryButton} onPress={handleAddUserSubmit}>
               <Text style={styles.primaryButtonText}>Register User</Text>
+            </Pressable>
+          </View>
+        </SafeAreaView>
+      </Modal>
+
+      {/* Payment Modal */}
+      <Modal visible={payVisible} animationType="slide">
+        <SafeAreaView style={styles.modalShell}>
+          <View style={styles.modalHeader}>
+            <Text style={styles.modalTitle}>Log Payment: {selectedMerchant?.name}</Text>
+            <Pressable onPress={() => !paySubmitting && setPayVisible(false)}>
+              <Text style={styles.closeText}>Close</Text>
+            </Pressable>
+          </View>
+          <View style={styles.modalContent}>
+            <Text style={styles.fieldLabel}>
+              Outstanding: N{Number(selectedMerchant?.balance ?? 0).toLocaleString()}
+            </Text>
+            <Text style={styles.fieldLabel}>Amount (NGN)</Text>
+            <TextInput
+              style={styles.input}
+              keyboardType="number-pad"
+              value={payAmount}
+              onChangeText={(t) => setPayAmount(t.replace(/[^0-9]/g, ''))}
+              placeholder="Amount collected"
+            />
+            <Text style={styles.fieldLabel}>Method</Text>
+            <View style={styles.choiceRow}>
+              {PAYMENT_METHODS.map((m) => (
+                <Pressable
+                  key={m}
+                  style={[styles.choiceChip, payMethod === m && styles.choiceChipSelected]}
+                  onPress={() => setPayMethod(m)}
+                >
+                  <Text style={styles.choiceText}>{m}</Text>
+                </Pressable>
+              ))}
+            </View>
+            <Pressable
+              style={[styles.primaryButton, paySubmitting && styles.buttonDisabled]}
+              onPress={submitPayment}
+              disabled={paySubmitting}
+            >
+              {paySubmitting ? (
+                <ActivityIndicator color="#fff" />
+              ) : (
+                <Text style={styles.primaryButtonText}>Record Payment</Text>
+              )}
             </Pressable>
           </View>
         </SafeAreaView>
@@ -490,25 +628,44 @@ export function FieldOfficerApp() {
             <ActivityIndicator size="large" style={{ marginTop: 50 }} />
           ) : (
             <ScrollView style={styles.modalContent}>
-              <Text style={styles.sectionTitle}>REPAYMENTS</Text>
-              {userHistory?.payments.length === 0 ? (
+              {/* Defensive shape handling throughout: mood/stockLevel/traffic
+                  are nullable in the DB, and a partial payload must degrade to
+                  placeholders, never a render crash. */}
+              <Text style={styles.sectionTitle}>DISBURSEMENTS</Text>
+              {!Array.isArray(userHistory?.disbursements) || userHistory.disbursements.length === 0 ? (
+                <Text style={styles.emptyText}>No disbursements recorded.</Text>
+              ) : (
+                userHistory.disbursements.map((d, i) => (
+                  <View key={i} style={styles.historyItem}>
+                    <Text style={styles.historyMain}>
+                      N{Number(d.amount ?? 0).toLocaleString()} (daily: N{Number(d.dailyInstallment ?? 0).toLocaleString()})
+                    </Text>
+                    <Text style={styles.historySub}>{new Date(d.timestamp).toLocaleString()}</Text>
+                  </View>
+                ))
+              )}
+
+              <Text style={[styles.sectionTitle, { marginTop: 20 }]}>REPAYMENTS</Text>
+              {!Array.isArray(userHistory?.payments) || userHistory.payments.length === 0 ? (
                 <Text style={styles.emptyText}>No payments recorded.</Text>
               ) : (
-                userHistory?.payments.map((p, i) => (
+                userHistory.payments.map((p, i) => (
                   <View key={i} style={styles.historyItem}>
-                    <Text style={styles.historyMain}>N{p.amount.toLocaleString()} ({p.method})</Text>
+                    <Text style={styles.historyMain}>N{Number(p.amount ?? 0).toLocaleString()} ({p.method || 'cash'})</Text>
                     <Text style={styles.historySub}>{new Date(p.timestamp).toLocaleString()}</Text>
                   </View>
                 ))
               )}
 
               <Text style={[styles.sectionTitle, { marginTop: 20 }]}>AUDITS</Text>
-              {userHistory?.audits.length === 0 ? (
+              {!Array.isArray(userHistory?.audits) || userHistory.audits.length === 0 ? (
                 <Text style={styles.emptyText}>No audits recorded.</Text>
               ) : (
-                userHistory?.audits.map((a, i) => (
+                userHistory.audits.map((a, i) => (
                   <View key={i} style={styles.historyItem}>
-                    <Text style={styles.historyMain}>{a.mood.toUpperCase()} | Stock: {a.stockLevel} | Traffic: {a.traffic}</Text>
+                    <Text style={styles.historyMain}>
+                      {(a.mood ?? 'unknown').toUpperCase()} | Stock: {a.stockLevel ?? '—'} | Traffic: {a.traffic ?? '—'}
+                    </Text>
                     {a.notes ? <Text style={styles.historyNotes}>{a.notes}</Text> : null}
                     <Text style={styles.historySub}>{new Date(a.timestamp).toLocaleString()}</Text>
                   </View>
@@ -544,6 +701,9 @@ const styles = StyleSheet.create({
   plusButtonText: { color: '#fff', fontWeight: '700', fontSize: 12 },
   logoutText: { color: '#ef4444', fontWeight: '600' },
   content: { padding: 16, gap: 20 },
+  syncBanner: { backgroundColor: '#fef3c7', padding: 12, borderRadius: 12, borderLeftWidth: 4, borderLeftColor: '#d97706' },
+  syncBannerText: { fontSize: 13, color: '#92400e', fontWeight: '600' },
+  buttonDisabled: { opacity: 0.6 },
   intelCard: { backgroundColor: '#eef2ff', padding: 16, borderRadius: 16, borderLeftWidth: 4, borderLeftColor: '#4f46e5' },
   intelTitle: { fontWeight: '700', color: '#312e81', marginBottom: 4 },
   intelText: { fontSize: 13, color: '#3730a3', lineHeight: 18 },

@@ -27,6 +27,24 @@ export function setAuthToken(token: string | null) {
   authToken = token;
 }
 
+// Called when the server rejects our token (expired / revoked). Registered by
+// AuthContext so a stale persisted session degrades to a clean re-login
+// instead of an endless wall of failing requests.
+let onUnauthorized: (() => void) | null = null;
+
+export function setOnUnauthorized(handler: (() => void) | null) {
+  onUnauthorized = handler;
+}
+
+/** Couldn't reach the server at all (offline / timeout) — as opposed to the
+ * server reaching a decision we must respect. The offline payment queue only
+ * retries these. */
+export class NetworkError extends Error {}
+
+export function isNetworkError(error: unknown): boolean {
+  return error instanceof NetworkError;
+}
+
 async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
@@ -44,11 +62,15 @@ async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
     });
   } catch (error) {
     if (error instanceof Error && error.name === 'AbortError') {
-      throw new Error('Request timed out. Please check your connection and retry.');
+      throw new NetworkError('Request timed out. Please check your connection and retry.');
     }
-    throw new Error('Network request failed. Please check your connection.');
+    throw new NetworkError('Network request failed. Please check your connection.');
   } finally {
     clearTimeout(timeout);
+  }
+
+  if (response.status === 401 && !path.startsWith('/auth/')) {
+    onUnauthorized?.();
   }
 
   if (!response.ok) {
@@ -85,7 +107,13 @@ export async function login(email: string, password: string): Promise<AuthRespon
   });
 }
 
-export async function register(data: { email: string; password: string; firstName: string; lastName: string }): Promise<AuthResponse> {
+export async function register(data: {
+  email: string;
+  password: string;
+  firstName: string;
+  lastName: string;
+  inviteCode?: string;
+}): Promise<AuthResponse> {
   return request<AuthResponse>('/auth/register', {
     method: 'POST',
     body: JSON.stringify(data)
@@ -109,16 +137,32 @@ export async function createUser(data: { name: string; phone: string; location: 
 }
 
 export async function getUserHistory(userId: string) {
-  return request<{ 
+  return request<{
     payments: Array<{ amount: number; method: string; timestamp: string }>;
-    audits: Array<{ mood: string; stockLevel: string; traffic: string; notes: string; timestamp: string }>;
+    audits: Array<{ mood: string | null; stockLevel: string | null; traffic: string | null; notes: string | null; timestamp: string }>;
+    disbursements: Array<{ amount: number; dailyInstallment: number; timestamp: string }>;
   }>(`/users/${userId}/history`);
 }
 
 // --- ACTIONS ---
 
-export async function recordRepayment(data: { userId: string; amount: number; method: string; officerId: string }) {
-  return request<{ success: boolean; id: string }>('/payments', {
+export type PaymentMethod = 'cash' | 'pos' | 'transfer';
+
+export interface RepaymentRequest {
+  userId: string;
+  amount: number;
+  method: PaymentMethod;
+  /** Generated client-side per confirmed payment; the server dedupes on it so
+   * retries (manual or from the offline queue) can never double-decrement. */
+  idempotencyKey: string;
+}
+
+export function newIdempotencyKey(): string {
+  return `pay-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
+export async function recordRepayment(data: RepaymentRequest) {
+  return request<{ success: boolean; id: string; duplicate?: boolean }>('/payments', {
     method: 'POST',
     body: JSON.stringify(data)
   });

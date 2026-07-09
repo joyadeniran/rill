@@ -9,7 +9,7 @@ import {
   TextInput,
   View
 } from 'react-native';
-import { login, register, setAuthToken } from '../services/api';
+import { login, register } from '../services/api';
 import { useAuth } from '../contexts/AuthContext';
 
 export function AuthScreen() {
@@ -18,8 +18,9 @@ export function AuthScreen() {
   const [lastName, setLastName] = useState('');
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
+  const [inviteCode, setInviteCode] = useState('');
   const [loading, setLoading] = useState(false);
-  const { setUserData } = useAuth();
+  const { signIn } = useAuth();
 
   const handleAuth = async () => {
     if (!email || !password) {
@@ -30,9 +31,9 @@ export function AuthScreen() {
     setLoading(true);
     try {
       if (isLogin) {
+        // Password is sent exactly as typed — never trim a password.
         const response = await login(email.trim(), password);
-        setAuthToken(response.token);
-        setUserData({ ...response.officer, role: 'co' });
+        signIn(response.token, { ...response.officer, role: 'co' });
       } else {
         if (!firstName || !lastName) {
           Alert.alert('Error', 'Please provide your name');
@@ -43,10 +44,10 @@ export function AuthScreen() {
           email: email.trim(),
           password,
           firstName: firstName.trim(),
-          lastName: lastName.trim()
+          lastName: lastName.trim(),
+          inviteCode: inviteCode.trim() || undefined
         });
-        setAuthToken(response.token);
-        setUserData({ ...response.officer, role: 'co' });
+        signIn(response.token, { ...response.officer, role: 'co' });
       }
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Authentication failed';
@@ -96,6 +97,16 @@ export function AuthScreen() {
           onChangeText={setPassword}
           style={styles.input}
         />
+
+        {!isLogin ? (
+          <TextInput
+            autoCapitalize="none"
+            placeholder="Invite code (from your supervisor)"
+            value={inviteCode}
+            onChangeText={setInviteCode}
+            style={styles.input}
+          />
+        ) : null}
 
         <Pressable onPress={handleAuth} style={styles.primaryButton} disabled={loading}>
           {loading ? (
