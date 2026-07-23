@@ -41,6 +41,27 @@ export function setOnUnauthorized(handler: (() => void) | null) {
  * retries these. */
 export class NetworkError extends Error {}
 
+/**
+ * The server reached a decision and said no. Carries per-field messages so
+ * forms can show the error against the offending input rather than a single
+ * opaque alert.
+ */
+export class ApiError extends Error {
+  status: number;
+  fields: Record<string, string>;
+
+  constructor(message: string, status: number, fields: Record<string, string> = {}) {
+    super(message);
+    this.name = 'ApiError';
+    this.status = status;
+    this.fields = fields;
+  }
+}
+
+export function fieldErrors(error: unknown): Record<string, string> {
+  return error instanceof ApiError ? error.fields : {};
+}
+
 export function isNetworkError(error: unknown): boolean {
   return error instanceof NetworkError;
 }
@@ -74,8 +95,15 @@ async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
   }
 
   if (!response.ok) {
-    const errorData = await response.json().catch(() => ({} as { error?: string }));
-    throw new Error(errorData.error || `Request failed with status ${response.status}`);
+    const errorData = await response
+      .json()
+      .catch(() => ({} as { error?: string; fields?: Record<string, string> }));
+    const message =
+      errorData.error ||
+      (response.status >= 500
+        ? 'The server hit an unexpected problem. Please try again.'
+        : `Request failed with status ${response.status}`);
+    throw new ApiError(message, response.status, errorData.fields || {});
   }
 
   // A 200 response can still carry a non-JSON body (proxy/HTML error page,

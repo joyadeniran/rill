@@ -15,23 +15,69 @@ export function setToken(token: string | null) {
   else localStorage.removeItem(TOKEN_KEY);
 }
 
+/**
+ * Thrown for any non-2xx response. Carries the server's per-field messages so
+ * forms can render errors inline against the offending input instead of
+ * showing one opaque banner.
+ */
+export class ApiError extends Error {
+  status: number;
+  fields: Record<string, string>;
+
+  constructor(message: string, status: number, fields: Record<string, string> = {}) {
+    super(message);
+    this.name = 'ApiError';
+    this.status = status;
+    this.fields = fields;
+  }
+}
+
+/** Couldn't reach the server at all — distinct from the server saying no. */
+export class NetworkError extends Error {}
+
+const REQUEST_TIMEOUT_MS = 30000;
+
 async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
   const token = getToken();
-  const response = await fetch(`${API_BASE}${path}`, {
-    ...options,
-    headers: {
-      'Content-Type': 'application/json',
-      ...(token ? { Authorization: `Bearer ${token}` } : {}),
-      ...options.headers
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+
+  let response: Response;
+  try {
+    response = await fetch(`${API_BASE}${path}`, {
+      ...options,
+      signal: controller.signal,
+      headers: {
+        'Content-Type': 'application/json',
+        ...(token ? { Authorization: `Bearer ${token}` } : {}),
+        ...options.headers
+      }
+    });
+  } catch (error) {
+    if (error instanceof Error && error.name === 'AbortError') {
+      throw new NetworkError('The server took too long to respond. Please try again.');
     }
-  });
+    throw new NetworkError('Cannot reach the server. Check your connection and try again.');
+  } finally {
+    clearTimeout(timeout);
+  }
+
   if (response.status === 401) {
     setToken(null);
-    throw new Error('Session expired. Please sign in again.');
+    throw new ApiError('Your session has expired. Please sign in again.', 401);
   }
+
+  // A non-JSON body (proxy HTML error page, empty 502 during a cold start)
+  // must not throw an unguarded SyntaxError inside a render path.
   const data = await response.json().catch(() => null);
+
   if (!response.ok) {
-    throw new Error((data && (data.error as string)) || `Request failed (${response.status})`);
+    const message =
+      (data && (data.error as string)) ||
+      (response.status >= 500
+        ? 'The server hit an unexpected problem. Please try again.'
+        : `Request failed (${response.status})`);
+    throw new ApiError(message, response.status, (data && data.fields) || {});
   }
   return data as T;
 }
