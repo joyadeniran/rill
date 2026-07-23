@@ -465,3 +465,54 @@ prebuild --clean: manifest ENABLED=false, bundle embeds
 ### Explicitly NOT changed (reserved for evidence)
 - New Architecture stays ON (`newArchEnabled=true`). If the next build is still blank, that is the next suspect (S2) — but disabling it is a human decision, not a blind edit.
 - `session.ts tokenExpiryMs` reads `split('.')[0]` (JWT header, not payload) — a real but separate bug, out of scope for the blank screen.
+
+
+---
+
+## Blank/Crashing APK — ACTUAL Root Cause Found (unhoisted expo modules)
+
+**Date:** 2026-07-23
+**Status:** Root cause identified from device evidence. **This supersedes the previous entry's hypothesis.**
+
+### Correction to the prior entry
+The previous fix removed `expo-updates` on the theory that it mediated bundle loading and caused the blank screen. **That hypothesis was wrong.** Removing expo-updates was harmless cleanup (the app never used OTA), but it was not the cause. The real cause was found only once device logs were captured.
+
+### Evidence (adb logcat, Infinix X6531B, package com.supplyashop.rill)
+```
+E ReactNativeJS: Cannot find native module 'ExpoAsset', js engine: hermes
+W ReactNativeJS: No native ExponentConstants module found, are you sure
+                 the expo-constants's module is linked properly?
+E ReactNativeJS: Invariant Violation: "main" has not been registered.
+                 * A module failed to load due to an error and
+                   `AppRegistry.registerComponent` wasn't called.
+```
+That last line **is** the blank screen: a native module fails to resolve → the JS module graph throws during load → `registerRootComponent` never runs → nothing is ever registered to render.
+
+### Root cause
+`expo@53.0.27` declares `expo-asset`, `expo-constants`, `expo-file-system`, `expo-font` and `expo-keep-awake` as direct dependencies. npm was placing all five **nested** at `node_modules/expo/node_modules/<name>` instead of hoisting them to the top level.
+
+**`expo-modules-autolinking` only discovers TOP-LEVEL modules.** Confirmed directly:
+```
+before:  expo, expo-modules-core, expo-secure-store, expo-system-ui        (4)
+after:   + expo-asset, expo-constants, expo-file-system, expo-font,
+           expo-keep-awake                                                 (9)
+```
+So those five native modules were never compiled into the APK — the app shipped without `ExpoAsset`/`ExpoConstants` and died at launch. This is why the app had **never** rendered, from the very first build.
+
+Notably there was **no version conflict** forcing the nesting (`expo-asset` had exactly one requirement, `~11.1.7`, from `expo` itself) and no `.npmrc`/`install-strategy` override — `npm explain` showed a single clean chain. A full `rm -rf node_modules package-lock.json && npm install` still nested them, so this is an npm placement quirk with the `expo` meta-package, not a corrupt lockfile.
+
+### Fix
+- `mobile/package.json`: declared the five modules as **explicit direct dependencies** (via `npx expo install`), which forces top-level placement where autolinking finds them. Verified with `expo-modules-autolinking resolve -p android` — the exact command Gradle consumes — now reporting all 9 modules.
+- `mobile/app.json`: `expo install` added the `expo-asset` and `expo-font` config plugins.
+- `mobile/src/__tests__/nativeModuleLinking.test.ts` (new): asserts each of the five resolves at top-level `node_modules` **and** is declared a direct dependency. Fails if anything un-hoists them again.
+
+### Verification
+```
+expo-modules-autolinking resolve -p android: 9 modules (was 4)
+tsc --noEmit: clean
+jest: 13/13 passing
+expo-doctor: 18/18
+```
+
+### Still unproven
+The fix is verified at the autolinking/build-config layer but **not yet on a device** — that requires a new APK. New Architecture remains ON and was never implicated by the logs.
