@@ -432,3 +432,36 @@ root npm test: 4 suites, 60 tests passing
 ### Not verified locally (no JDK / Android SDK on this machine)
 - `./gradlew assembleRelease` was not run — everything up to the native compile step is confirmed; the Gradle step itself is unproven here.
 - The Expo template's `release` buildType falls back to the **debug keystore**: the codemagic APK is fine for internal distribution but is **not Play Store uploadable**. A real keystore must be wired via Codemagic code signing before publishing. (Comment left in `codemagic.yaml`.)
+
+
+---
+
+## Blank Release APK — Fix (expo-updates disabled/removed)
+
+**Date:** 2026-07-23
+**Symptom:** The first successful APK opened to a completely blank screen — not even the "Loading Rill CO…" spinner.
+
+### Diagnosis (evidence + honest limits)
+- Startup path: `index.js` → `App.tsx` renders `loading=true` first frame → a light screen + spinner. "Nothing at all" ⇒ failure is **before React's first commit** (native bundle-loading or a module-load throw), which the `ErrorBoundary` cannot catch (it only catches render errors in its children). Evidence: `App.tsx:10-18`, `ErrorBoundary.tsx:26-40`.
+- **Leading suspect = the `updates` config added in the prior session.** Enabling expo-updates flips the manifest to `ENABLED=true`, making expo-updates *mediate which JS bundle loads at launch*. In a bare `gradlew assembleRelease` build (not `eas build`), the embedded-update step isn't reliably wired, so it can have no bundle to load → blank. Evidence: `app.json` updates block; prebuild manifest `ENABLED true→false`; `grep expo-updates android/app/build.gradle` empty.
+- **expo-updates is not referenced anywhere in app code** (`grep -rn "expo-updates\|Updates\."` → none) — it was pure risk surface for an app that doesn't use OTA.
+- Device confirmation was **not possible**: Expo Go on the test iPhone is SDK 54 vs. project SDK 53 (incompatible), and an EAS dev build was too slow. So the cause remains **suspected, not device-verified** — but the JS boot graph is proven healthy by the new boot test (module imports don't throw under jest), which points away from a JS/native-link cause and toward the release-only updates path.
+
+### Fix applied
+- `mobile/app.json`: removed the `updates` and `runtimeVersion` blocks. Generated manifest now emits `expo.modules.updates.ENABLED=false` → RN loads the embedded bundle directly (the safe pre-change path). Bundle still embeds (`bundleCommand = "export:embed"`).
+- `mobile/eas.json`: removed the `channel` keys from all three profiles (they require expo-updates).
+- `mobile/package.json` + lockfile: removed the dead `expo-updates` dependency.
+- `mobile/src/__tests__/appBoot.test.tsx` (new): renders `<App/>` and asserts the first frame ("Loading Rill CO…") mounts — a regression guard for the blank-screen class — plus asserts `app.json` does not re-enable updates.
+- `.github/workflows/ci.yml`: mobile job now runs `npm ci` + `npx jest` (was typecheck-only), so a boot regression fails CI before an APK is built.
+
+### Verification
+```
+tsc --noEmit: clean
+jest: 3/3 passing (incl. new boot test)
+expo-doctor: 18/18
+prebuild --clean: manifest ENABLED=false, bundle embeds
+```
+
+### Explicitly NOT changed (reserved for evidence)
+- New Architecture stays ON (`newArchEnabled=true`). If the next build is still blank, that is the next suspect (S2) — but disabling it is a human decision, not a blind edit.
+- `session.ts tokenExpiryMs` reads `split('.')[0]` (JWT header, not payload) — a real but separate bug, out of scope for the blank screen.
