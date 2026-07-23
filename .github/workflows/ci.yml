@@ -20,7 +20,7 @@ jobs:
       - run: npm test
 
   mobile:
-    name: Mobile typecheck
+    name: Mobile typecheck & boot test
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -29,7 +29,11 @@ jobs:
           node-version: 20
           cache: npm
           cache-dependency-path: mobile/package-lock.json
-      - run: npm install
+      - run: npm ci
         working-directory: mobile
       - run: npx tsc --noEmit
+        working-directory: mobile
+      # Boot smoke test: catches a module-load/render throw (the blank-screen
+      # class) before an APK is ever cut. See src/__tests__/appBoot.test.tsx.
+      - run: npx jest
         working-directory: mobile
