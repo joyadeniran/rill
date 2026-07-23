@@ -62,7 +62,8 @@ describe('Rill API Integration Tests', () => {
         userId,
         amount: 1000,
         officerId,
-        method: 'cash'
+        method: 'cash',
+        idempotencyKey: `test-undisbursed-${Date.now()}`
       });
     expect(res.status).toBe(400);
     expect(res.body.error).toMatch(/exceeds/i);
@@ -158,7 +159,7 @@ describe('Rill API Integration Tests', () => {
     const res = await request(app)
       .post('/api/payments')
       .set(auth())
-      .send({ userId, amount: -500, officerId, method: 'cash' });
+      .send({ userId, amount: -500, officerId, method: 'cash', idempotencyKey: `test-neg-${Date.now()}` });
     expect(res.status).toBe(400);
   });
 
@@ -166,7 +167,7 @@ describe('Rill API Integration Tests', () => {
     const res = await request(app)
       .post('/api/payments')
       .set(auth())
-      .send({ userId, amount: 0, officerId, method: 'cash' });
+      .send({ userId, amount: 0, officerId, method: 'cash', idempotencyKey: `test-zero-${Date.now()}` });
     expect(res.status).toBe(400);
   });
 
@@ -357,7 +358,7 @@ describe('Roles, disbursements & payment integrity', () => {
     const res = await request(app)
       .post('/api/payments')
       .set(coAuth())
-      .send({ userId: 'ghost-user', amount: 100, method: 'cash' });
+      .send({ userId: 'ghost-user', amount: 100, method: 'cash', idempotencyKey: `test-unknown-${Date.now()}` });
     expect(res.status).toBe(404);
   });
 
@@ -365,7 +366,7 @@ describe('Roles, disbursements & payment integrity', () => {
     const res = await request(app)
       .post('/api/payments')
       .set(coAuth())
-      .send({ userId: merchantId, amount: 999999, method: 'cash' });
+      .send({ userId: merchantId, amount: 999999, method: 'cash', idempotencyKey: `test-exceeds-${Date.now()}` });
     expect(res.status).toBe(400);
     expect(res.body.error).toMatch(/exceeds/i);
   });
@@ -374,7 +375,15 @@ describe('Roles, disbursements & payment integrity', () => {
     const res = await request(app)
       .post('/api/payments')
       .set(coAuth())
-      .send({ userId: merchantId, amount: 100, method: 'crypto' });
+      .send({ userId: merchantId, amount: 100, method: 'crypto', idempotencyKey: `test-method-${Date.now()}` });
+    expect(res.status).toBe(400);
+  });
+
+  test('payment with no idempotencyKey -> 400 (CRIT-B27)', async () => {
+    const res = await request(app)
+      .post('/api/payments')
+      .set(coAuth())
+      .send({ userId: merchantId, amount: 100, method: 'cash' });
     expect(res.status).toBe(400);
   });
 
