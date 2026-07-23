@@ -38,6 +38,10 @@
         "projectId": "f82dddaf-c4c6-403a-9ee4-36ff78282e4a"
       }
     },
-    "owner": "supplyashop"
+    "owner": "supplyashop",
+    "plugins": [
+      "expo-asset",
+      "expo-font"
+    ]
   }
 }
