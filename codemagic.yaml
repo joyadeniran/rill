@@ -8,33 +8,46 @@ workflows:
         EXPO_PUBLIC_API_BASE_URL: "https://rill-app.onrender.com/api"
         # Add EXPO_TOKEN to Codemagic environment variables for automated login
       node: 20
+      # React Native 0.79 / AGP 8.x require JDK 17. Without pinning, the build
+      # picks the machine default (21 on newer images) and Gradle fails.
+      java: 17
     cache:
       cache_paths:
-        - $CM_BUILD_DIR/mobile/node_modules
+        # node_modules is deliberately NOT cached: `npm ci` wipes it anyway, and
+        # a stale cache is what previously let the installed react-native drift
+        # away from the version in package-lock.json.
         - $HOME/.gradle/caches
     scripts:
       - name: Install dependencies
         script: |
+          set -euo pipefail
           cd mobile
-          npm install
-      - name: Install EAS CLI
-        script: |
-          npm install -g eas-cli
+          # `npm ci` (not `npm install`) so the build uses exactly the locked
+          # versions and fails loudly on lockfile drift instead of silently
+          # resolving something else.
+          npm ci
       - name: Run Expo Prebuild
         script: |
+          set -euo pipefail
           cd mobile
-          # This generates the /android folder for the local build
-          npx expo prebuild --platform android --no-install
+          # --clean so a leftover ./android from a cached workspace can never
+          # shadow the config in app.json.
+          npx expo prebuild --platform android --no-install --clean
       - name: Build Android APK (Local)
         script: |
+          set -euo pipefail
           cd mobile/android
-          ./gradlew assembleRelease
+          # NOTE: the Expo template's `release` buildType falls back to the
+          # debug keystore. This APK is fine for internal distribution but is
+          # NOT Play Store uploadable — wire up a real keystore via Codemagic
+          # code signing before publishing.
+          ./gradlew assembleRelease --no-daemon
     artifacts:
       - mobile/android/app/build/outputs/apk/release/*.apk
     publishing:
       email:
         recipients:
-          - your-email@example.com # Change this to your email
+          - hi@supplya.shop
         notify:
           success: true
           failure: true

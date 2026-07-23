@@ -282,3 +282,153 @@ Diff:     re-read against supplya invariants — no req.body mass-assign, no
   jest) → CI "Backend tests" red. Added `/mobile/` to root jest
   `testPathIgnorePatterns`. Reproduced red, verified green with the exact CI
   command. Mobile tests still run via `cd mobile && jest` (jest-expo).
+
+---
+
+## 2026-07-11 — Cross-repo Supplya audit follow-up: F20/F21/F30 fixed
+
+Three findings from the same-day Supplya 4-repo audit, deferred from the
+initial fix pass and closed out here. All test-first; full suite green
+(4 suites, 60 tests) plus `npm run lint` (tsc --noEmit) clean.
+
+### Environment fix (required before any test could run)
+- `better-sqlite3@^12.4.1`'s installed native binding (12.6.2) was compiled
+  against an older Node ABI (NODE_MODULE_VERSION 141) than the local Node
+  26.4.0 requires (147) — `npm rebuild` failed (node-gyp/V8 header
+  incompatibility with this Node version). Bumped to `better-sqlite3@12.11.1`
+  (still within the `^12.4.1` range), which shipped a prebuilt binding that
+  loads correctly. Verified: baseline `npm test` went from "Test suite
+  failed to run" to 42/42 passing before any of the fixes below were made.
+
+### [CRIT-B21-rill / F21] Legacy plaintext-password comparison was not constant-time
+`verifyPassword`'s pre-hash migration path (`server.js`) did `password ===
+storedPassword` for accounts created before `hashPassword` was added — `===`
+short-circuits on the first mismatched byte, leaking via response timing how
+many leading characters of a guessed password are correct. The migration
+path itself is legitimate and was kept (an account is upgraded to a hash on
+its next successful login, in `login()`) — only the comparison was fixed.
+- **server.js**: added `constantTimeStringEqual(a, b)` — HMACs both inputs
+  to a fixed-length digest, then `crypto.timingSafeEqual`s the digests
+  (sidesteps `timingSafeEqual`'s equal-length-buffer requirement without
+  weakening the comparison — a digest mismatch implies an input mismatch).
+  `verifyPassword`'s legacy branch now calls it instead of `===`.
+- **server.js**: added a named export block (`hashPassword`,
+  `isHashedPassword`, `verifyPassword`, `constantTimeStringEqual`) alongside
+  the existing `export default app` — these weren't practically testable
+  through the HTTP layer alone.
+- **server-password.test.js** (new): 10 tests covering the hashed path
+  (unchanged behavior), the legacy path (correct/wrong/near-miss-prefix
+  passwords), and `constantTimeStringEqual` directly (including a source
+  check that `verifyPassword` no longer contains `password ===
+  storedPassword`).
+
+### [CRIT-B27 / F20] Payment idempotencyKey was optional
+`POST /api/payments`'s dedup logic only protects a retry that sends the same
+`idempotencyKey` — a client that omits it entirely (or retries twice with no
+key) gets zero double-payment protection, since SQL UNIQUE indexes don't
+treat multiple NULLs as conflicting. The mobile field-officer app
+(`mobile/src/services/api.ts`, `mobile/src/components/FieldOfficerApp.tsx`)
+already types `idempotencyKey` as required and always sends one, so
+enforcing it server-side is a safe tightening, not a breaking change.
+- **server.js**: added `body('idempotencyKey').notEmpty()` to the route's
+  validation chain.
+- **payment-idempotency-required.test.js** (new): 3 tests — missing key
+  rejected, empty-string key rejected, valid key succeeds.
+- **server.test.js**: updated 6 existing `/api/payments` calls that omitted
+  `idempotencyKey` (they were asserting unrelated 400/404 outcomes — balance
+  exceeded, unknown user, invalid method, negative/zero amount — and broke
+  once the field became required); added one new explicit
+  "no idempotencyKey -> 400" test to the "Roles, disbursements & payment
+  integrity" suite.
+
+### [CRIT-B28 / F30] AI prompt construction concatenated untrusted text with instructions
+`/api/rebuttal` and `/api/risk-briefing` built their Gemini prompts by
+string-concatenating officer-entered free text (a merchant's stated
+`excuse`, `merchantName`, audit `notes` embedded in `logs`/`merchants`)
+directly with the fixed instructions — a classic prompt-injection shape.
+Both endpoints require auth and only return advisory text (no tool use, no
+money movement), so this is hardening, not a critical fix — but there was no
+defense at all.
+- **server.js**: both routes now pass the fixed instructions via
+  `config.systemInstruction` (the Gemini SDK's recommended separation — the
+  model treats it with more authority than inline conversational text) and
+  clearly label the request body as untrusted data to summarize/quote, never
+  as instructions. `/api/rebuttal` additionally length-caps `merchantName`
+  (200 chars) and `excuse` (2000 chars) via `express-validator`, bounding
+  the size of any injection payload.
+- **ai-prompt-injection.test.js** (new): 4 structural tests (GEMINI_API_KEY
+  isn't configured in this test environment, so `checkAi` 503s before the
+  actual model call — these verify the prompt-construction source directly):
+  `systemInstruction` is used on both routes, the old
+  instructions-and-user-data-in-one-template-literal shape is gone from
+  `/api/rebuttal`, and `excuse` has a length cap.
+
+### Verification
+```
+npm test:  4 suites, 60 tests passing (was 1 suite, 42 tests before the
+           better-sqlite3 fix unblocked the run)
+npm run lint (tsc --noEmit): clean
+```
+
+
+---
+
+## Expo Build Failure — Root Cause & Fix
+
+**Date:** 2026-07-23
+**Scope:** "Expo build is never successful" — diagnose why, fix carefully, address the cascade, unhandled exceptions and edge cases.
+
+### Method
+Reproduced the real pipeline locally before changing anything, instead of guessing:
+- `npm ci` in `mobile/` — lockfile valid, 1040 packages, RN 0.79.6 / expo 53.0.27 resolved.
+- `npx expo prebuild --platform android --no-install --clean` — succeeded.
+- `npx expo export --platform android` — Metro bundled 580 modules → 1.84 MB hbc, no errors.
+- `npx eas-cli config` run from **both** the repo root and `mobile/`, then diffed — this is what exposed the root cause.
+- Inspected asset PNGs (valid 1254×1254 square), `expo-doctor` (16/18), and the generated `AndroidManifest.xml`.
+
+### Root cause (confirmed by diffing `eas config` output)
+**Two Expo projects in one repo; the wrong one was winning.** The repo root carried its own `app.json` + `eas.json`. An `eas build` run from the repo root (the natural thing to do — and the tracked root `.expo/` directory proves it happened) resolved to the *web* project, not the mobile app:
+
+| | Root config (wrong) | `mobile/` config (correct) |
+|---|---|---|
+| name / slug | `react-example` | `Rill CO` / `rill` |
+| version | `0.0.0` | `1.0.0` |
+| platforms | `["web"]` — no android/ios | ios, android, web |
+| EAS projectId | `479cdb23-…` | `f82dddaf-…` |
+| bundle id | `com.suppplya.rill` (typo, 3 p's) | `com.supplyashop.rill` |
+
+The root `package.json` has **no `expo` and no `react-native` dependency** — it is the Vite web app. A native build from that directory cannot succeed. The real `mobile/` project was never the thing being built.
+
+### Fixes applied
+
+**Primary**
+- Deleted root `app.json` and `eas.json` (recoverable via git) — they pointed at a different EAS project with a typo'd bundle id and no native platforms.
+- Untracked `.expo/` and `mobile/.expo/` (machine-specific state that had been committed) and added `.expo/` to root `.gitignore`.
+- Added `mobile:build:android` / `mobile:build:ios` / `mobile:build:preview` scripts to the root `package.json`, each `cd mobile` first, so the correct invocation is discoverable and the directory mistake cannot recur.
+
+**Cascade — config declared but inert**
+- `mobile/app.json`: all three `eas.json` profiles declare a `channel` and `expo-updates` is a dependency, but there was no `updates.url` or `runtimeVersion` — the generated manifest had `expo.modules.updates.ENABLED=false`, so OTA was silently dead and `eas build` warns about the orphaned channels. Added `updates.url` + `runtimeVersion: appVersion`; manifest now emits `ENABLED=true`. `fallbackToCacheTimeout: 0` keeps it non-blocking at launch. **Behavior change:** builds now check for updates on launch.
+- Added `expo-system-ui` — prebuild warned that `userInterfaceStyle: "light"` is inert without it, leaving the app exposed to Android dark mode despite hardcoded light colors.
+- Set `android.edgeToEdgeEnabled: false` explicitly, pinning current behavior instead of relying on a fallback that flips in SDK 54.
+
+**`codemagic.yaml` — same class of bug as the prior lockfile-drift commit**
+- `npm install` → `npm ci`: `npm install` ignores lockfile drift; this is exactly how installed `react-native` had drifted to 0.79.3 against a locked 0.79.6.
+- Stopped caching `mobile/node_modules` — a stale cache is the other half of that drift.
+- Pinned `java: 17` (RN 0.79 / AGP 8 fail on the JDK 21 default on newer CI images).
+- `--clean` on prebuild so a cached `android/` can't shadow `app.json`.
+- `set -euo pipefail` on every script so a failing step fails the build instead of passing through.
+- Removed the dead global `eas-cli` install step; replaced the `your-email@example.com` placeholder with `hi@supplya.shop`.
+
+### Verification
+```
+expo-doctor:   18/18 checks passed (was 16/18)
+tsc --noEmit:  clean
+expo prebuild --clean: clean, 0 warnings (was 2)
+expo export --platform android: 580 modules, 1.84 MB bundle
+mobile jest:   1/1 passing
+root npm test: 4 suites, 60 tests passing
+```
+
+### Not verified locally (no JDK / Android SDK on this machine)
+- `./gradlew assembleRelease` was not run — everything up to the native compile step is confirmed; the Gradle step itself is unproven here.
+- The Expo template's `release` buildType falls back to the **debug keystore**: the codemagic APK is fine for internal distribution but is **not Play Store uploadable**. A real keystore must be wired via Codemagic code signing before publishing. (Comment left in `codemagic.yaml`.)
