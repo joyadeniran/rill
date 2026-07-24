@@ -9,7 +9,7 @@ import {
   TextInput,
   View
 } from 'react-native';
-import { login, register } from '../services/api';
+import { ApiError, login, register } from '../services/api';
 import { useAuth } from '../contexts/AuthContext';
 
 export function AuthScreen() {
@@ -20,26 +20,37 @@ export function AuthScreen() {
   const [password, setPassword] = useState('');
   const [inviteCode, setInviteCode] = useState('');
   const [loading, setLoading] = useState(false);
+  // Per-field messages, fed from the API's `fields` map so the officer sees
+  // which input the server rejected rather than one opaque alert.
+  const [errors, setErrors] = useState<Record<string, string>>({});
   const { signIn } = useAuth();
 
+  const clearError = (key: string) => setErrors((e) => ({ ...e, [key]: '' }));
+
   const handleAuth = async () => {
-    if (!email || !password) {
-      Alert.alert('Error', 'Please fill in all fields');
+    // Validate locally first so an obvious mistake gets an instant answer with
+    // no round-trip; the server stays the authority and overwrites these.
+    const local: Record<string, string> = {};
+    if (!email.trim()) local.email = 'Enter your email address';
+    if (!password) local.password = 'Enter your password';
+    if (!isLogin) {
+      if (!firstName.trim()) local.firstName = 'First name is required';
+      if (!lastName.trim()) local.lastName = 'Last name is required';
+      if (password && password.length < 6) local.password = 'Password must be at least 6 characters';
+    }
+    if (Object.keys(local).length > 0) {
+      setErrors(local);
       return;
     }
 
     setLoading(true);
+    setErrors({});
     try {
       if (isLogin) {
         // Password is sent exactly as typed — never trim a password.
         const response = await login(email.trim(), password);
         signIn(response.token, { ...response.officer, role: 'co' });
       } else {
-        if (!firstName || !lastName) {
-          Alert.alert('Error', 'Please provide your name');
-          setLoading(false);
-          return;
-        }
         const response = await register({
           email: email.trim(),
           password,
@@ -50,8 +61,13 @@ export function AuthScreen() {
         signIn(response.token, { ...response.officer, role: 'co' });
       }
     } catch (error) {
-      const message = error instanceof Error ? error.message : 'Authentication failed';
-      Alert.alert('Rill CO', message);
+      if (error instanceof ApiError && Object.keys(error.fields).length > 0) {
+        setErrors(error.fields);
+      }
+      Alert.alert(
+        isLogin ? 'Could not sign in' : 'Could not create account',
+        error instanceof Error ? error.message : 'Authentication failed'
+      );
     } finally {
       setLoading(false);
     }
@@ -67,18 +83,24 @@ export function AuthScreen() {
 
         {!isLogin ? (
           <View style={styles.row}>
-            <TextInput
-              placeholder="First name"
-              value={firstName}
-              onChangeText={setFirstName}
-              style={[styles.input, styles.halfInput]}
-            />
-            <TextInput
-              placeholder="Last name"
-              value={lastName}
-              onChangeText={setLastName}
-              style={[styles.input, styles.halfInput]}
-            />
+            <View style={styles.halfInput}>
+              <TextInput
+                placeholder="First name"
+                value={firstName}
+                onChangeText={(t) => { setFirstName(t); clearError('firstName'); }}
+                style={[styles.input, !!errors.firstName && styles.inputError]}
+              />
+              {errors.firstName ? <Text style={styles.errorText}>{errors.firstName}</Text> : null}
+            </View>
+            <View style={styles.halfInput}>
+              <TextInput
+                placeholder="Last name"
+                value={lastName}
+                onChangeText={(t) => { setLastName(t); clearError('lastName'); }}
+                style={[styles.input, !!errors.lastName && styles.inputError]}
+              />
+              {errors.lastName ? <Text style={styles.errorText}>{errors.lastName}</Text> : null}
+            </View>
           </View>
         ) : null}
 
@@ -87,25 +109,30 @@ export function AuthScreen() {
           keyboardType="email-address"
           placeholder="Email"
           value={email}
-          onChangeText={setEmail}
-          style={styles.input}
+          onChangeText={(t) => { setEmail(t); clearError('email'); }}
+          style={[styles.input, !!errors.email && styles.inputError]}
         />
+        {errors.email ? <Text style={styles.errorText}>{errors.email}</Text> : null}
         <TextInput
           secureTextEntry
           placeholder="Password"
           value={password}
-          onChangeText={setPassword}
-          style={styles.input}
+          onChangeText={(t) => { setPassword(t); clearError('password'); }}
+          style={[styles.input, !!errors.password && styles.inputError]}
         />
+        {errors.password ? <Text style={styles.errorText}>{errors.password}</Text> : null}
 
         {!isLogin ? (
-          <TextInput
-            autoCapitalize="none"
-            placeholder="Invite code (from your supervisor)"
-            value={inviteCode}
-            onChangeText={setInviteCode}
-            style={styles.input}
-          />
+          <View>
+            <TextInput
+              autoCapitalize="none"
+              placeholder="Invite code (from your supervisor)"
+              value={inviteCode}
+              onChangeText={(t) => { setInviteCode(t); clearError('inviteCode'); }}
+              style={[styles.input, !!errors.inviteCode && styles.inputError]}
+            />
+            {errors.inviteCode ? <Text style={styles.errorText}>{errors.inviteCode}</Text> : null}
+          </View>
         ) : null}
 
         <Pressable onPress={handleAuth} style={styles.primaryButton} disabled={loading}>
@@ -116,7 +143,7 @@ export function AuthScreen() {
           )}
         </Pressable>
 
-        <Pressable onPress={() => setIsLogin((value) => !value)} style={styles.linkButton}>
+        <Pressable onPress={() => { setIsLogin((value) => !value); setErrors({}); }} style={styles.linkButton}>
           <Text style={styles.linkText}>
             {isLogin ? "Don't have an account? Create one" : 'Already have an account? Sign in'}
           </Text>
@@ -164,6 +191,14 @@ const styles = StyleSheet.create({
   },
   halfInput: {
     flex: 1
+  },
+  inputError: {
+    borderColor: '#dc2626'
+  },
+  errorText: {
+    color: '#b91c1c',
+    fontSize: 12,
+    marginTop: 4
   },
   primaryButton: {
     backgroundColor: '#111827',

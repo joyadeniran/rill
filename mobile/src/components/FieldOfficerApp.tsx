@@ -28,6 +28,8 @@ import {
   type PaymentMethod
 } from '../services/api';
 import { enqueuePayment, flushQueue, hasPendingFor, pendingCount } from '../services/paymentQueue';
+import { captureAndUpload } from '../services/photos';
+import { ApiError } from '../services/api';
 import type { CheckInLog, Merchant } from '../types';
 
 type ChatMessage = { role: 'user' | 'ai'; text: string };
@@ -38,6 +40,22 @@ type UserHistory = {
 };
 
 const PAYMENT_METHODS: PaymentMethod[] = ['cash', 'pos', 'transfer'];
+
+/**
+ * The server already produces a precise, human-readable message for every
+ * failure. Replacing it with a generic "Failed to record audit" throws that
+ * away and leaves the officer with no idea what to fix — so always prefer the
+ * server's text, and only fall back when there genuinely isn't one.
+ */
+function errorMessage(error: unknown, fallback: string): string {
+  if (error instanceof Error && error.message) return error.message;
+  return fallback;
+}
+
+/** Per-field messages from the API, for showing errors under the right input. */
+function fieldsOf(error: unknown): Record<string, string> {
+  return error instanceof ApiError ? error.fields : {};
+}
 
 const emptyCheckIn = {
   mood: 'positive' as CheckInLog['mood'],
@@ -76,6 +94,11 @@ export function FieldOfficerApp() {
   const [checkInForm, setCheckInForm] = useState(emptyCheckIn);
   const [escalateReason, setEscalateReason] = useState('');
   const [newUserForm, setNewUserForm] = useState({ name: '', phone: '', location: '' });
+  // Field-level errors keyed by input name, fed straight from the API so the
+  // officer sees exactly which field the server rejected and why.
+  const [formErrors, setFormErrors] = useState<Record<string, string>>({});
+  const [submitting, setSubmitting] = useState(false);
+  const [photoStatus, setPhotoStatus] = useState('');
   
   // Chat
   const [chatHistory, setChatHistory] = useState<ChatMessage[]>([]);
@@ -101,7 +124,7 @@ export function FieldOfficerApp() {
       const data = await getTodayRoute();
       setMerchants(data);
     } catch (error) {
-      Alert.alert('Error', "Failed to fetch today's route");
+      Alert.alert("Couldn't load your route", errorMessage(error, "Today's route could not be loaded."));
       pendingCount().then(setPendingSync).catch(() => {});
     } finally {
       setRefreshing(false);
@@ -240,7 +263,7 @@ export function FieldOfficerApp() {
       const data = await getUserHistory(merchant.id);
       setUserHistory(data);
     } catch (error) {
-      Alert.alert('Error', 'Failed to fetch history');
+      Alert.alert("Couldn't load history", errorMessage(error, 'This merchant\'s history could not be loaded.'));
       setHistoryVisible(false);
     } finally {
       setHistoryLoading(false);
@@ -249,6 +272,8 @@ export function FieldOfficerApp() {
 
   const handleCheckInSubmit = async () => {
     if (!selectedMerchant) return;
+    setSubmitting(true);
+    setFormErrors({});
     try {
       await recordAudit({
         userId: selectedMerchant.id,
@@ -256,37 +281,84 @@ export function FieldOfficerApp() {
       });
       setCheckInVisible(false);
       setCheckInForm(emptyCheckIn);
-      Alert.alert('Success', 'Audit recorded');
+      setPhotoStatus('');
+      Alert.alert('Audit recorded', `Field audit saved for ${selectedMerchant.name}.`);
     } catch (error) {
-      Alert.alert('Error', 'Failed to record audit');
+      setFormErrors(fieldsOf(error));
+      Alert.alert('Audit not recorded', errorMessage(error, 'The audit could not be saved.'));
+    } finally {
+      setSubmitting(false);
     }
   };
 
+  /** Attach field evidence to the merchant currently open. */
+  const attachPhoto = async (kind: 'audit' | 'payment' | 'merchant', source: 'camera' | 'library') => {
+    if (!selectedMerchant) return;
+    setPhotoStatus('Uploading photo…');
+    const result = await captureAndUpload(selectedMerchant.id, kind, undefined, source);
+    if (result.ok) {
+      setPhotoStatus('Photo attached ✓');
+      return;
+    }
+    setPhotoStatus('');
+    // A cancel carries no message — it is not an error and must show nothing.
+    if (result.message) Alert.alert('Photo not attached', result.message);
+  };
+
   const handleEscalateSubmit = async () => {
-    if (!selectedMerchant || !escalateReason) return;
+    if (!selectedMerchant) return;
+    // Previously this returned silently on an empty reason, so tapping the
+    // button appeared to do nothing at all.
+    if (!escalateReason.trim()) {
+      setFormErrors({ reason: 'Choose or describe a reason for escalating' });
+      return;
+    }
+    setSubmitting(true);
+    setFormErrors({});
     try {
       await recordEscalation({
         userId: selectedMerchant.id,
-        reason: escalateReason
+        reason: escalateReason.trim()
       });
       setEscalateVisible(false);
       setEscalateReason('');
-      Alert.alert('Escalated', 'Risk flag sent to admin');
+      Alert.alert('Escalated', `${selectedMerchant.name} has been flagged for admin review.`);
     } catch (error) {
-      Alert.alert('Error', 'Failed to escalate');
+      setFormErrors(fieldsOf(error));
+      Alert.alert('Not escalated', errorMessage(error, 'The escalation could not be sent.'));
+    } finally {
+      setSubmitting(false);
     }
   };
 
   const handleAddUserSubmit = async () => {
-    if (!newUserForm.name || !newUserForm.location) return;
+    // Validate locally first so the officer gets an instant answer instead of a
+    // round-trip, but the server remains the authority and its field messages
+    // overwrite these if they disagree.
+    const local: Record<string, string> = {};
+    if (!newUserForm.name.trim()) local.name = 'Merchant name is required';
+    if (!newUserForm.location.trim()) local.location = 'Location is required';
+    if (Object.keys(local).length > 0) {
+      setFormErrors(local);
+      return;
+    }
+    setSubmitting(true);
+    setFormErrors({});
     try {
-      await createUser(newUserForm);
+      await createUser({
+        name: newUserForm.name.trim(),
+        phone: newUserForm.phone.trim(),
+        location: newUserForm.location.trim()
+      });
       setAddUserVisible(false);
       setNewUserForm({ name: '', phone: '', location: '' });
-      Alert.alert('Success', 'New borrower added as pending');
+      Alert.alert('Merchant added', 'They are pending until an admin disburses credit.');
       fetchData();
     } catch (error) {
-      Alert.alert('Error', 'Failed to add borrower');
+      setFormErrors(fieldsOf(error));
+      Alert.alert('Not added', errorMessage(error, 'The merchant could not be added.'));
+    } finally {
+      setSubmitting(false);
     }
   };
 
@@ -442,27 +514,34 @@ export function FieldOfficerApp() {
             <Pressable onPress={() => setAddUserVisible(false)}><Text style={styles.closeText}>Close</Text></Pressable>
           </View>
           <View style={styles.modalContent}>
-            <TextInput 
-              placeholder="Full Name" 
-              style={styles.input} 
+            <TextInput
+              placeholder="Full Name"
+              style={[styles.input, formErrors.name && styles.inputError]}
               value={newUserForm.name}
-              onChangeText={t => setNewUserForm(f => ({...f, name: t}))}
+              onChangeText={t => { setNewUserForm(f => ({...f, name: t})); setFormErrors(e => ({...e, name: ''})); }}
             />
-            <TextInput 
-              placeholder="Phone Number" 
-              style={styles.input} 
+            {formErrors.name ? <Text style={styles.errorText}>{formErrors.name}</Text> : null}
+            <TextInput
+              placeholder="Phone Number"
+              style={[styles.input, formErrors.phone && styles.inputError]}
               keyboardType="phone-pad"
               value={newUserForm.phone}
-              onChangeText={t => setNewUserForm(f => ({...f, phone: t}))}
+              onChangeText={t => { setNewUserForm(f => ({...f, phone: t})); setFormErrors(e => ({...e, phone: ''})); }}
             />
-            <TextInput 
-              placeholder="Location (Market/Stall)" 
-              style={styles.input} 
+            {formErrors.phone ? <Text style={styles.errorText}>{formErrors.phone}</Text> : null}
+            <TextInput
+              placeholder="Location (Market/Stall)"
+              style={[styles.input, formErrors.location && styles.inputError]}
               value={newUserForm.location}
-              onChangeText={t => setNewUserForm(f => ({...f, location: t}))}
+              onChangeText={t => { setNewUserForm(f => ({...f, location: t})); setFormErrors(e => ({...e, location: ''})); }}
             />
-            <Pressable style={styles.primaryButton} onPress={handleAddUserSubmit}>
-              <Text style={styles.primaryButtonText}>Register User</Text>
+            {formErrors.location ? <Text style={styles.errorText}>{formErrors.location}</Text> : null}
+            <Pressable
+              style={[styles.primaryButton, submitting && styles.buttonDisabled]}
+              onPress={handleAddUserSubmit}
+              disabled={submitting}
+            >
+              {submitting ? <ActivityIndicator color="#fff" /> : <Text style={styles.primaryButtonText}>Register User</Text>}
             </Pressable>
           </View>
         </SafeAreaView>
@@ -483,12 +562,13 @@ export function FieldOfficerApp() {
             </Text>
             <Text style={styles.fieldLabel}>Amount (NGN)</Text>
             <TextInput
-              style={styles.input}
+              style={[styles.input, formErrors.amount && styles.inputError]}
               keyboardType="number-pad"
               value={payAmount}
-              onChangeText={(t) => setPayAmount(t.replace(/[^0-9]/g, ''))}
+              onChangeText={(t) => { setPayAmount(t.replace(/[^0-9]/g, '')); setFormErrors(e => ({...e, amount: ''})); }}
               placeholder="Amount collected"
             />
+            {formErrors.amount ? <Text style={styles.errorText}>{formErrors.amount}</Text> : null}
             <Text style={styles.fieldLabel}>Method</Text>
             <View style={styles.choiceRow}>
               {PAYMENT_METHODS.map((m) => (
@@ -501,6 +581,16 @@ export function FieldOfficerApp() {
                 </Pressable>
               ))}
             </View>
+            <Text style={styles.fieldLabel}>Receipt photo (optional)</Text>
+            <View style={styles.choiceRow}>
+              <Pressable style={styles.choiceChip} onPress={() => attachPhoto('payment', 'camera')} disabled={paySubmitting}>
+                <Text style={styles.choiceText}>Take photo</Text>
+              </Pressable>
+              <Pressable style={styles.choiceChip} onPress={() => attachPhoto('payment', 'library')} disabled={paySubmitting}>
+                <Text style={styles.choiceText}>Choose photo</Text>
+              </Pressable>
+            </View>
+            {photoStatus ? <Text style={styles.helperText}>{photoStatus}</Text> : null}
             <Pressable
               style={[styles.primaryButton, paySubmitting && styles.buttonDisabled]}
               onPress={submitPayment}
@@ -548,15 +638,29 @@ export function FieldOfficerApp() {
                 </Pressable>
               ))}
             </View>
-            <TextInput 
-              placeholder="Field Notes..." 
-              style={styles.notesInput} 
-              multiline 
+            <TextInput
+              placeholder="Field Notes..."
+              style={styles.notesInput}
+              multiline
               value={checkInForm.notes}
               onChangeText={t => setCheckInForm(f => ({...f, notes: t}))}
             />
-            <Pressable style={styles.primaryButton} onPress={handleCheckInSubmit}>
-              <Text style={styles.primaryButtonText}>Save Audit</Text>
+            <Text style={styles.fieldLabel}>Photo evidence (optional)</Text>
+            <View style={styles.choiceRow}>
+              <Pressable style={styles.choiceChip} onPress={() => attachPhoto('audit', 'camera')} disabled={submitting}>
+                <Text style={styles.choiceText}>Take photo</Text>
+              </Pressable>
+              <Pressable style={styles.choiceChip} onPress={() => attachPhoto('audit', 'library')} disabled={submitting}>
+                <Text style={styles.choiceText}>Choose photo</Text>
+              </Pressable>
+            </View>
+            {photoStatus ? <Text style={styles.helperText}>{photoStatus}</Text> : null}
+            <Pressable
+              style={[styles.primaryButton, submitting && styles.buttonDisabled]}
+              onPress={handleCheckInSubmit}
+              disabled={submitting}
+            >
+              {submitting ? <ActivityIndicator color="#fff" /> : <Text style={styles.primaryButtonText}>Save Audit</Text>}
             </Pressable>
           </ScrollView>
         </SafeAreaView>
@@ -692,6 +796,21 @@ const statusTextStyles = StyleSheet.create({
 });
 
 const styles = StyleSheet.create({
+  inputError: {
+    borderColor: '#dc2626',
+    borderWidth: 1
+  },
+  errorText: {
+    color: '#b91c1c',
+    fontSize: 12,
+    marginTop: -6,
+    marginBottom: 10
+  },
+  helperText: {
+    color: '#475569',
+    fontSize: 12,
+    marginBottom: 10
+  },
   safeArea: { flex: 1, backgroundColor: '#f8fafc' },
   topHeader: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', padding: 16, backgroundColor: '#fff', borderBottomWidth: 1, borderBottomColor: '#e2e8f0' },
   headerTitle: { fontSize: 20, fontWeight: '800', color: '#1e1b4b' },
