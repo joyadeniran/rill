@@ -20,6 +20,9 @@ this index is the fast path.
 | #12 | Defaulters & assignment | Defaulter list + assign-to-CO + `/today` scoping |
 | #13 | Photo capability | Field evidence end to end, mobile capture + console viewer |
 | #14 | Console overhaul | Role-aware admin/lender web console |
+| #16 | Mobile UX | Inline field errors, real server messages, photo capture |
+| #17 | Edge cases | Concurrency, money bounds, malformed input, cascade, auth |
+| #18 | Message polish | Humanised the last leaked field name |
 
 Full specification: [spec.md](spec.md).
 
@@ -731,12 +734,72 @@ Recorded because both were shipped with confidence and turned out wrong.
 
 ---
 
+## PR #16 — Mobile UX
+
+The CO app answered every failure with a generic alert and, on some paths, returned
+*silently* so the button appeared to do nothing at all.
+
+- Handlers surfaced `Alert.alert('Error', 'Failed to record audit')`, discarding the
+  precise message the server had already produced. They now show the server's text.
+- Both forms render the API's `fields` map inline against the offending input.
+- Silent early returns removed — escalating with no reason now says so.
+- Local checks use the **same wording as the server**, so a message does not change
+  shape depending on where it was caught.
+- Submit buttons disable and spin while in flight.
+- Camera/library capture wired into the audit and payment flows. A cancelled capture
+  shows nothing, because cancelling is not an error.
+
+5 new tests. Result: 20 mobile tests.
+
+---
+
+## PR #17 — Adversarial edge cases
+
+21 tests for what a flaky connection, a retrying client or a hostile caller produces.
+All passed against the existing implementation; the suite pins that behaviour.
+
+Concurrency (same idempotency key fired 3× simultaneously → exactly one payment, ledger
+moves once) · money bounds (over-balance, zero, negative, fractional) · malformed input
+(broken JSON, nulls, SQL-injection-shaped names stored as literal text, oversized
+strings, unicode) · auth (expired, tampered, forged-role, garbage headers) · cascade
+deletion across six tables · empty states returning `[]` not `null`.
+
+Verified repeatable: 3 consecutive fresh-DB runs plus one against an existing DB
+(which also exercises migration idempotency).
+
+---
+
+## PR #18 — Message polish
+
+Live production smoke test surfaced `"idempotencyKey is required"` — a leaked field
+name rather than English. Fixed, and every other `.withMessage()` audited for the same
+class of leak.
+
+---
+
+## Final state (2026-07-24)
+
+| | |
+|---|---|
+| Tests | **152 backend + 20 mobile**, green on repeated runs |
+| Typecheck | web + mobile clean |
+| expo-doctor | 18/18 |
+| PRs | #9–#18, all CI-green and squash-merged to `main` |
+| Production | deployed and verified live |
+
+**Live production verification** (`https://rill-app.onrender.com`):
+health 200 on postgres · unauthenticated calls 401 · CO correctly blocked from `/users`
+and `/defaulters` (403) · wrong invite code 403 · field errors returned with a `fields`
+map · malformed photo rejected · short password named against the field. Smoke-test
+records were removed from production afterwards; the owner's own account and merchant
+were left untouched.
+
 ## Remaining / planned
 
-- [ ] Mobile UX pass: field-level validation rendering, photo capture wired into the
-      audit and payment flows, loading/disabled states, offline feedback.
-- [ ] Edge-case hardening sweep + repeated full-suite runs.
-- [ ] Rotate the Supabase DB password and the invite code (both exposed in a chat
-      transcript during the outage debugging).
+- [ ] **Rotate the Supabase DB password and the invite code** — both were exposed in a
+      chat transcript during the outage debugging.
 - [ ] Migrate photos to object storage before volume becomes material (spec.md §7).
 - [ ] Groups / group enforcement (schema field exists, no logic).
+- [ ] Real Play Store keystore — the Codemagic APK is still debug-signed, so it is fine
+      for internal distribution but not uploadable.
+- [ ] Multi-instance rate limiting (the current limiter is in-memory, single-instance).
