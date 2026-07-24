@@ -5,6 +5,7 @@
 const API_BASE = (import.meta.env.VITE_API_BASE as string | undefined) || '/api';
 
 const TOKEN_KEY = 'rill-admin-token';
+const OFFICER_KEY = 'rill-admin-officer';
 
 export function getToken(): string | null {
   return localStorage.getItem(TOKEN_KEY);
@@ -13,6 +14,27 @@ export function getToken(): string | null {
 export function setToken(token: string | null) {
   if (token) localStorage.setItem(TOKEN_KEY, token);
   else localStorage.removeItem(TOKEN_KEY);
+}
+
+/** Cached so a page refresh keeps the console on the right role's views
+ *  without a round-trip. The token remains the only thing the server trusts. */
+export function getStoredOfficer(): AdminOfficer | null {
+  try {
+    const raw = localStorage.getItem(OFFICER_KEY);
+    return raw ? (JSON.parse(raw) as AdminOfficer) : null;
+  } catch {
+    return null;
+  }
+}
+
+export function setStoredOfficer(officer: AdminOfficer | null) {
+  if (officer) localStorage.setItem(OFFICER_KEY, JSON.stringify(officer));
+  else localStorage.removeItem(OFFICER_KEY);
+}
+
+export function signOut() {
+  setToken(null);
+  setStoredOfficer(null);
 }
 
 /**
@@ -82,12 +104,42 @@ async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
   return data as T;
 }
 
+export type Role = 'co' | 'admin' | 'lender';
+
 export interface AdminOfficer {
   id: string;
   email: string;
   firstName: string;
   lastName: string;
-  role: 'admin';
+  role: Role;
+  active?: boolean;
+}
+
+export interface Defaulter {
+  id: string;
+  name: string;
+  phone: string | null;
+  location: string;
+  totalOwed: number;
+  balance: number;
+  dailyInstallment: number;
+  status: string;
+  assignedCoId: string | null;
+  assignedCoName: string | null;
+  lastPaymentTimestamp: string | null;
+  hoursSinceLastPayment: number | null;
+  neverPaid: boolean;
+}
+
+export interface PhotoMeta {
+  id: string;
+  kind: string;
+  mimeType: string;
+  caption: string | null;
+  sizeBytes: number;
+  timestamp: string;
+  url: string;
+  officerName: string | null;
 }
 
 export interface AdminUser {
@@ -118,15 +170,101 @@ export async function adminLogin(email: string, password: string) {
     body: JSON.stringify({ email, password })
   });
   setToken(data.token);
+  setStoredOfficer(data.officer);
   return data.officer;
 }
 
+/** Lenders (and any Rill-native account) sign in here. Admins use the
+ *  Supplya proxy above — Rill stores no admin credentials. */
+export async function lenderLogin(email: string, password: string) {
+  const data = await request<{ officer: AdminOfficer; token: string }>('/auth/login', {
+    method: 'POST',
+    body: JSON.stringify({ email, password })
+  });
+  setToken(data.token);
+  setStoredOfficer(data.officer);
+  return data.officer;
+}
+
+export async function changePassword(currentPassword: string, newPassword: string) {
+  return request<{ success: boolean }>('/auth/change-password', {
+    method: 'POST',
+    body: JSON.stringify({ currentPassword, newPassword })
+  });
+}
+
+export async function getDefaulters() {
+  const d = await request<Defaulter[]>('/defaulters');
+  return Array.isArray(d) ? d : [];
+}
+
+export async function assignDefaulter(userId: string, officerId: string | null) {
+  return request<{ success: boolean; assignedCoId: string | null }>(`/users/${userId}/assign`, {
+    method: 'POST',
+    body: JSON.stringify({ officerId })
+  });
+}
+
+export async function getOfficers() {
+  const d = await request<AdminOfficer[]>('/officers');
+  return Array.isArray(d) ? d : [];
+}
+
+export async function createOfficer(data: {
+  email: string;
+  password: string;
+  firstName: string;
+  lastName: string;
+  role: 'co' | 'lender';
+}) {
+  return request<{ officer: AdminOfficer }>('/officers', {
+    method: 'POST',
+    body: JSON.stringify(data)
+  });
+}
+
+export async function updateOfficer(id: string, data: { active?: boolean; role?: 'co' | 'lender' }) {
+  return request<{ success: boolean }>(`/officers/${id}`, {
+    method: 'PATCH',
+    body: JSON.stringify(data)
+  });
+}
+
+export async function getUserPhotos(userId: string) {
+  const d = await request<PhotoMeta[]>(`/users/${userId}/photos`);
+  return Array.isArray(d) ? d : [];
+}
+
+export async function deleteUser(userId: string) {
+  return request<{ success: boolean }>(`/users/${userId}`, { method: 'DELETE' });
+}
+
+export async function getRiskBriefing(logs: unknown[], merchants: unknown[]) {
+  return request<{ text: string }>('/risk-briefing', {
+    method: 'POST',
+    body: JSON.stringify({ logs, merchants })
+  });
+}
+
+/** Photos are auth-gated, so they cannot be used as a bare <img src>.
+ *  Fetches with the bearer token and returns an object URL. */
+export async function fetchPhotoObjectUrl(photoId: string): Promise<string> {
+  const token = getToken();
+  const res = await fetch(`${API_BASE}/photos/${photoId}`, {
+    headers: token ? { Authorization: `Bearer ${token}` } : {}
+  });
+  if (!res.ok) throw new ApiError('Could not load photo', res.status);
+  return URL.createObjectURL(await res.blob());
+}
+
 export async function getUsers() {
-  return request<AdminUser[]>('/users');
+  const d = await request<AdminUser[]>('/users');
+  return Array.isArray(d) ? d : [];
 }
 
 export async function getEscalations() {
-  return request<Escalation[]>('/escalations');
+  const d = await request<Escalation[]>('/escalations');
+  return Array.isArray(d) ? d : [];
 }
 
 export async function disburse(userId: string, amount: number, dailyInstallment: number) {
