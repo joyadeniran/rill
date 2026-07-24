@@ -24,6 +24,7 @@ const REQUIRED_TOP_LEVEL_MODULES = [
   'expo-constants',
   'expo-file-system',
   'expo-font',
+  'expo-image-picker',
   'expo-keep-awake'
 ];
 
