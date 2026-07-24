@@ -269,6 +269,7 @@ const initDb = async () => {
       daily_installment INTEGER DEFAULT 0,
       status TEXT DEFAULT 'pending',
       last_payment_date TEXT,
+      assigned_co_id TEXT,
       created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
     );
 
@@ -325,6 +326,7 @@ async function migrateSchemaAdditions() {
   const additions = [
     ['officers', 'role', "TEXT DEFAULT 'co'"],
     ['officers', 'active', 'INTEGER DEFAULT 1'],
+    ['users', 'assigned_co_id', 'TEXT'],
     ['payments', 'idempotency_key', 'TEXT']
   ];
   for (const [table, column, type] of additions) {
@@ -605,15 +607,26 @@ app.post('/api/auth/admin-login', authRateLimit, [
 });
 
 app.get('/api/today', requireAuth, async (req, res) => {
-  const { rows: users } = await query(`
-    SELECT 
-      id, name, phone, location, group_id as "groupId", 
-      total_owed as "totalOwed", balance, daily_installment as "dailyInstallment", 
+  // A CO sees his own book: merchants assigned to him, plus any that are
+  // still unassigned (so no merchant is ever invisible to the field). A
+  // merchant assigned to a DIFFERENT CO is hidden — that is the whole point
+  // of assignment: two officers must never work the same merchant.
+  // Admin and lender see everything.
+  const scopeToOfficer = req.officer.role === 'co';
+  const { rows: users } = await query(
+    `
+    SELECT
+      id, name, phone, location, group_id as "groupId",
+      total_owed as "totalOwed", balance, daily_installment as "dailyInstallment",
       status, last_payment_date as "lastPaymentDate",
+      assigned_co_id as "assignedCoId",
       (SELECT MAX(timestamp) FROM payments WHERE user_id = users.id) as "lastPaymentTimestamp"
-    FROM users 
+    FROM users
     WHERE status != 'deactivated'
-  `);
+    ${scopeToOfficer ? 'AND (assigned_co_id IS NULL OR assigned_co_id = ?)' : ''}
+  `,
+    scopeToOfficer ? [req.officer.sub] : []
+  );
   
   const today = new Date();
   const merchants = users.map(u => {
@@ -680,6 +693,116 @@ app.post('/api/disbursements', requireAuth, requireRole('admin'), [
       params: [amount, amount, dailyInstallment, userId] }
   ]);
   res.json({ success: true, id });
+});
+
+// --- DEFAULTERS & ASSIGNMENT ---
+// A defaulter is an ACTIVE merchant carrying a balance whose last payment was
+// more than DEFAULT_AFTER_HOURS ago. Never-paid counts: `lastPaymentTimestamp`
+// is NULL, which we treat as infinitely overdue. This mirrors the red band in
+// RILL_SPEC "STATUS LOGIC" so the field app and the console agree on who is
+// in trouble.
+const DEFAULT_AFTER_HOURS = 48;
+
+app.get('/api/defaulters', requireAuth, requireRole('admin', 'lender'), async (req, res) => {
+  const { rows } = await query(`
+    SELECT
+      u.id, u.name, u.phone, u.location,
+      u.total_owed as "totalOwed", u.balance,
+      u.daily_installment as "dailyInstallment",
+      u.status, u.assigned_co_id as "assignedCoId",
+      o.first_name as "assignedCoFirstName", o.last_name as "assignedCoLastName",
+      (SELECT MAX(timestamp) FROM payments WHERE user_id = u.id) as "lastPaymentTimestamp"
+    FROM users u
+    LEFT JOIN officers o ON o.id = u.assigned_co_id
+    WHERE u.status = 'active' AND u.balance > 0
+  `);
+
+  const now = Date.now();
+  const defaulters = rows
+    .map((u) => {
+      // No payment ever -> treat as maximally overdue rather than "0 hours".
+      const hoursSinceLastPayment = u.lastPaymentTimestamp
+        ? (now - new Date(u.lastPaymentTimestamp).getTime()) / 36e5
+        : null;
+      return {
+        id: u.id,
+        name: u.name,
+        phone: u.phone,
+        location: u.location,
+        totalOwed: u.totalOwed,
+        balance: u.balance,
+        dailyInstallment: u.dailyInstallment,
+        status: u.status,
+        assignedCoId: u.assignedCoId ?? null,
+        assignedCoName: u.assignedCoFirstName
+          ? `${u.assignedCoFirstName} ${u.assignedCoLastName || ''}`.trim()
+          : null,
+        lastPaymentTimestamp: u.lastPaymentTimestamp ?? null,
+        hoursSinceLastPayment:
+          hoursSinceLastPayment === null ? null : Math.floor(hoursSinceLastPayment),
+        neverPaid: u.lastPaymentTimestamp === null
+      };
+    })
+    .filter((u) => u.neverPaid || u.hoursSinceLastPayment > DEFAULT_AFTER_HOURS)
+    // Worst first: never-paid, then longest since a payment, then biggest balance.
+    .sort((a, b) => {
+      if (a.neverPaid !== b.neverPaid) return a.neverPaid ? -1 : 1;
+      const h = (b.hoursSinceLastPayment ?? 0) - (a.hoursSinceLastPayment ?? 0);
+      return h !== 0 ? h : b.balance - a.balance;
+    });
+
+  res.json(defaulters);
+});
+
+// Hand a merchant to a specific CO (or clear the assignment with null).
+app.post('/api/users/:id/assign', requireAuth, requireRole('admin'), async (req, res) => {
+  const { officerId } = req.body;
+
+  const { rows: merchants } = await query('SELECT id FROM users WHERE id = ?', [req.params.id]);
+  if (merchants.length === 0) return res.status(404).json({ error: 'Merchant not found' });
+
+  // Explicit null clears the assignment and returns the merchant to the
+  // shared pool.
+  if (officerId === null || officerId === '') {
+    await query('UPDATE users SET assigned_co_id = NULL WHERE id = ?', [req.params.id]);
+    return res.json({ success: true, assignedCoId: null });
+  }
+
+  if (typeof officerId !== 'string') {
+    return res.status(400).json({
+      error: 'Select a collection officer',
+      fields: { officerId: 'Select a collection officer' }
+    });
+  }
+
+  const { rows: officers } = await query(
+    'SELECT id, role, active FROM officers WHERE id = ?',
+    [officerId]
+  );
+  const officer = officers[0];
+  if (!officer) {
+    return res.status(400).json({
+      error: 'That officer does not exist',
+      fields: { officerId: 'This officer no longer exists' }
+    });
+  }
+  // Only COs do field work. Assigning to a lender (read-only) or an admin
+  // would create a merchant nobody actually collects from.
+  if (officer.role !== 'co') {
+    return res.status(400).json({
+      error: 'Merchants can only be assigned to a collection officer',
+      fields: { officerId: 'This account is not a collection officer' }
+    });
+  }
+  if (isDeactivated(officer)) {
+    return res.status(400).json({
+      error: 'That officer has been deactivated',
+      fields: { officerId: 'This officer is deactivated' }
+    });
+  }
+
+  await query('UPDATE users SET assigned_co_id = ? WHERE id = ?', [officerId, req.params.id]);
+  res.json({ success: true, assignedCoId: officerId });
 });
 
 // --- OFFICER MANAGEMENT (admin only) ---
