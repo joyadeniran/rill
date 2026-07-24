@@ -18,7 +18,9 @@
       "supportsTablet": true,
       "bundleIdentifier": "com.supplyashop.rill",
       "infoPlist": {
-        "NSLocationWhenInUseUsageDescription": "Rill CO uses your location to optimize your collection route and provide directions to merchants."
+        "NSLocationWhenInUseUsageDescription": "Rill CO uses your location to optimize your collection route and provide directions to merchants.",
+        "NSCameraUsageDescription": "Rill CO uses the camera so you can photograph shopfronts, stock and receipts as field evidence.",
+        "NSPhotoLibraryUsageDescription": "Rill CO needs access to your photos so you can attach evidence to an audit or payment."
       }
     },
     "android": {
@@ -30,7 +32,9 @@
       },
       "permissions": [
         "ACCESS_COARSE_LOCATION",
-        "ACCESS_FINE_LOCATION"
+        "ACCESS_FINE_LOCATION",
+        "CAMERA",
+        "READ_EXTERNAL_STORAGE"
       ]
     },
     "extra": {
@@ -41,7 +45,14 @@
     "owner": "supplyashop",
     "plugins": [
       "expo-asset",
-      "expo-font"
+      "expo-font",
+      [
+        "expo-image-picker",
+        {
+          "photosPermission": "Rill CO needs access to your photos so you can attach evidence to an audit or payment.",
+          "cameraPermission": "Rill CO uses the camera so you can photograph shopfronts, stock and receipts as field evidence."
+        }
+      ]
     ]
   }
 }

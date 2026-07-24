@@ -39,7 +39,17 @@ app.use(
       : undefined
   )
 );
-app.use(express.json());
+// Photos are base64 data URLs, which are far larger than any other payload
+// Rill accepts. Rather than raise the limit globally (which would widen the
+// DoS surface on every route), the photo route gets its own parser and is
+// skipped here.
+const PHOTO_ROUTE = '/api/photos';
+const PHOTO_BODY_LIMIT = '4mb';
+const jsonParser = express.json();
+app.use((req, res, next) => {
+  if (req.path === PHOTO_ROUTE) return next();
+  return jsonParser(req, res, next);
+});
 
 // Serve static files from the Vite build directory
 app.use(express.static(path.join(__dirname, 'dist')));
@@ -302,6 +312,18 @@ const initDb = async () => {
       timestamp TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
     );
 
+    CREATE TABLE IF NOT EXISTS photos (
+      id TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL,
+      officer_id TEXT NOT NULL,
+      kind TEXT NOT NULL,
+      mime_type TEXT NOT NULL,
+      data TEXT NOT NULL,
+      caption TEXT,
+      size_bytes INTEGER DEFAULT 0,
+      timestamp TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+    );
+
     CREATE TABLE IF NOT EXISTS escalations (
       id TEXT PRIMARY KEY,
       user_id TEXT NOT NULL,
@@ -369,7 +391,8 @@ const TIMESTAMP_COLUMNS = [
   ['users', 'created_at'],
   ['payments', 'timestamp'],
   ['audits', 'timestamp'],
-  ['escalations', 'timestamp']
+  ['escalations', 'timestamp'],
+  ['photos', 'timestamp']
 ];
 
 async function migratePostgresTimestamps() {
@@ -695,6 +718,133 @@ app.post('/api/disbursements', requireAuth, requireRole('admin'), [
   res.json({ success: true, id });
 });
 
+// --- PHOTOS (field evidence) ---
+// Stored as base64 in the DB. That is a deliberate MVP tradeoff — no object
+// store is provisioned — which makes the size cap and MIME allowlist below
+// load-bearing rather than cosmetic: without them a single upload could bloat
+// the row store or smuggle a non-image payload past the console.
+const PHOTO_KINDS = ['audit', 'payment', 'merchant', 'escalation'];
+const PHOTO_MIME_TYPES = ['image/jpeg', 'image/png', 'image/webp'];
+const PHOTO_MAX_BYTES = 2 * 1024 * 1024; // 2MB decoded
+const PHOTO_CAPTION_MAX = 280;
+
+/**
+ * Parse and validate a data URL into { mimeType, buffer }.
+ * Returns { error } instead of throwing so a malformed upload is a 400, never
+ * an unhandled exception in the request path.
+ */
+function parseImageDataUrl(dataUrl) {
+  if (typeof dataUrl !== 'string' || dataUrl.length === 0) {
+    return { error: 'Attach a photo' };
+  }
+  const match = /^data:([a-zA-Z0-9/+.-]+);base64,(.*)$/s.exec(dataUrl);
+  if (!match) {
+    return { error: 'Photo must be a base64 data URL' };
+  }
+  const [, mimeType, b64] = match;
+  if (!PHOTO_MIME_TYPES.includes(mimeType)) {
+    return { error: `Photo must be a JPEG, PNG or WebP image` };
+  }
+  // Reject anything that is not strictly valid base64 before decoding —
+  // Buffer.from silently drops invalid characters, which would let a corrupt
+  // payload through as a "valid" image.
+  const cleaned = b64.trim();
+  if (cleaned.length === 0 || !/^[A-Za-z0-9+/]+={0,2}$/.test(cleaned)) {
+    return { error: 'Photo data is not valid base64' };
+  }
+  const buffer = Buffer.from(cleaned, 'base64');
+  if (buffer.length === 0) return { error: 'Photo data is empty' };
+  if (buffer.length > PHOTO_MAX_BYTES) {
+    return { error: 'Photo is too large (max 2MB). Please retake at a lower quality.' };
+  }
+  return { mimeType, buffer, base64: cleaned };
+}
+
+app.post(
+  PHOTO_ROUTE,
+  requireAuth,
+  requireRole('co', 'admin'),
+  express.json({ limit: PHOTO_BODY_LIMIT }),
+  async (req, res) => {
+    const { userId, kind, dataUrl, caption } = req.body || {};
+    const fields = {};
+
+    if (!userId || typeof userId !== 'string') fields.userId = 'Select a merchant';
+    if (!PHOTO_KINDS.includes(kind)) {
+      fields.kind = `Kind must be one of: ${PHOTO_KINDS.join(', ')}`;
+    }
+    if (caption !== undefined && caption !== null) {
+      if (typeof caption !== 'string' || caption.length > PHOTO_CAPTION_MAX) {
+        fields.caption = `Caption must be ${PHOTO_CAPTION_MAX} characters or fewer`;
+      }
+    }
+    const parsed = parseImageDataUrl(dataUrl);
+    if (parsed.error) fields.dataUrl = parsed.error;
+
+    if (Object.keys(fields).length > 0) {
+      const names = Object.keys(fields);
+      return res.status(400).json({
+        error: names.length === 1 ? fields[names[0]] : 'Please correct the highlighted fields',
+        fields
+      });
+    }
+
+    const { rows } = await query('SELECT id FROM users WHERE id = ?', [userId]);
+    if (rows.length === 0) {
+      return res.status(400).json({
+        error: 'That merchant does not exist',
+        fields: { userId: 'This merchant no longer exists' }
+      });
+    }
+
+    const id = randomUUID();
+    await query(
+      'INSERT INTO photos (id, user_id, officer_id, kind, mime_type, data, caption, size_bytes) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+      [id, userId, req.officer.sub, kind, parsed.mimeType, parsed.base64, caption || null, parsed.buffer.length]
+    );
+    // Deliberately does not echo the image back — the client already has it.
+    res.json({ id, kind, sizeBytes: parsed.buffer.length, mimeType: parsed.mimeType });
+  }
+);
+
+// Listing stays light: metadata only, never the blobs. A merchant with 20
+// photos would otherwise return tens of megabytes to render a thumbnail row.
+app.get('/api/users/:id/photos', requireAuth, async (req, res) => {
+  const { rows } = await query(
+    `SELECT p.id, p.kind, p.mime_type as "mimeType", p.caption,
+            p.size_bytes as "sizeBytes", p.timestamp,
+            o.first_name as "officerFirstName", o.last_name as "officerLastName"
+     FROM photos p
+     LEFT JOIN officers o ON o.id = p.officer_id
+     WHERE p.user_id = ? ORDER BY p.timestamp DESC`,
+    [req.params.id]
+  );
+  res.json(
+    rows.map((p) => ({
+      ...p,
+      url: `/api/photos/${p.id}`,
+      officerName: p.officerFirstName
+        ? `${p.officerFirstName} ${p.officerLastName || ''}`.trim()
+        : null
+    }))
+  );
+});
+
+// Serves the actual bytes. Auth-gated: field evidence can identify a
+// merchant's premises and must not be public.
+app.get('/api/photos/:id', requireAuth, async (req, res) => {
+  const { rows } = await query('SELECT mime_type as "mimeType", data FROM photos WHERE id = ?', [
+    req.params.id
+  ]);
+  const photo = rows[0];
+  if (!photo) return res.status(404).json({ error: 'Photo not found' });
+
+  const buffer = Buffer.from(photo.data, 'base64');
+  res.setHeader('Content-Type', photo.mimeType);
+  res.setHeader('Cache-Control', 'private, max-age=3600');
+  res.send(buffer);
+});
+
 // --- DEFAULTERS & ASSIGNMENT ---
 // A defaulter is an ACTIVE merchant carrying a balance whose last payment was
 // more than DEFAULT_AFTER_HOURS ago. Never-paid counts: `lastPaymentTimestamp`
@@ -803,6 +953,27 @@ app.post('/api/users/:id/assign', requireAuth, requireRole('admin'), async (req,
 
   await query('UPDATE users SET assigned_co_id = ? WHERE id = ?', [officerId, req.params.id]);
   res.json({ success: true, assignedCoId: officerId });
+});
+
+// Hard-delete a merchant and every record that hangs off it. There are no DB
+// foreign keys here (the schema predates them and SQLite needs them enabled
+// per-connection), so orphaned payments/audits/photos would silently survive
+// and keep showing up in aggregates. Done in one transaction so a partial
+// delete can never leave a half-removed merchant behind.
+app.delete('/api/users/:id', requireAuth, requireRole('admin'), async (req, res) => {
+  const { rows } = await query('SELECT id FROM users WHERE id = ?', [req.params.id]);
+  if (rows.length === 0) return res.status(404).json({ error: 'Merchant not found' });
+
+  const id = req.params.id;
+  await runTransaction([
+    { sql: 'DELETE FROM photos WHERE user_id = ?', params: [id] },
+    { sql: 'DELETE FROM payments WHERE user_id = ?', params: [id] },
+    { sql: 'DELETE FROM audits WHERE user_id = ?', params: [id] },
+    { sql: 'DELETE FROM escalations WHERE user_id = ?', params: [id] },
+    { sql: 'DELETE FROM disbursements WHERE user_id = ?', params: [id] },
+    { sql: 'DELETE FROM users WHERE id = ?', params: [id] }
+  ]);
+  res.json({ success: true });
 });
 
 // --- OFFICER MANAGEMENT (admin only) ---
@@ -1093,6 +1264,19 @@ app.use((err, req, res, next) => {
   // Full detail server-side only; internals (paths, SQL, stack hints) must
   // never reach a client.
   console.error(err.stack);
+
+  // Body-parser rejections are the client's fault, not ours, and returning 500
+  // for them makes an oversized photo look like a server crash.
+  if (err.type === 'entity.too.large' || err.status === 413) {
+    return res.status(413).json({
+      error: 'That upload is too large. Please retake the photo at a lower quality.',
+      fields: { dataUrl: 'Photo is too large' }
+    });
+  }
+  if (err.type === 'entity.parse.failed' || err instanceof SyntaxError) {
+    return res.status(400).json({ error: 'The request body was not valid JSON' });
+  }
+
   res.status(500).json({ error: 'Internal Server Error' });
 });
 

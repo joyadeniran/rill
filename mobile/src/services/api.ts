@@ -237,3 +237,52 @@ export async function getLenderRiskBriefing(logs: CheckInLog[], merchants: Merch
   });
   return data.text;
 }
+
+// --- PHOTOS (field evidence) ---
+
+export type PhotoKind = 'audit' | 'payment' | 'merchant' | 'escalation';
+
+export interface PhotoMeta {
+  id: string;
+  kind: PhotoKind;
+  mimeType: string;
+  caption: string | null;
+  sizeBytes: number;
+  timestamp: string;
+  url: string;
+  officerName: string | null;
+}
+
+export async function uploadPhoto(data: {
+  userId: string;
+  kind: PhotoKind;
+  dataUrl: string;
+  caption?: string;
+}) {
+  return request<{ id: string; kind: PhotoKind; sizeBytes: number; mimeType: string }>('/photos', {
+    method: 'POST',
+    body: JSON.stringify(data)
+  });
+}
+
+export async function getUserPhotos(userId: string): Promise<PhotoMeta[]> {
+  const data = await request<PhotoMeta[]>(`/users/${userId}/photos`);
+  return Array.isArray(data) ? data : [];
+}
+
+/** Absolute URL for rendering a photo in an <Image source={{uri}} /> tag. */
+export function photoUri(photoId: string): string {
+  return `${API_BASE_URL}/photos/${photoId}`;
+}
+
+/** Auth header for <Image>, which does not go through `request`. */
+export function photoHeaders(): Record<string, string> {
+  return authToken ? { Authorization: `Bearer ${authToken}` } : {};
+}
+
+export async function changePassword(currentPassword: string, newPassword: string) {
+  return request<{ success: boolean }>('/auth/change-password', {
+    method: 'POST',
+    body: JSON.stringify({ currentPassword, newPassword })
+  });
+}
