@@ -1122,7 +1122,11 @@ app.post('/api/payments', requireAuth, requireRole('co', 'admin'), [
   body('userId').trim().notEmpty().withMessage('Select a merchant'),
   body('amount').isInt({ gt: 0 }).withMessage('Amount must be a whole number greater than 0'),
   body('method').optional().isIn(['cash', 'pos', 'transfer']).withMessage("Method must be 'cash', 'pos' or 'transfer'"),
-  body('idempotencyKey').notEmpty().withMessage('idempotencyKey is required'),
+  // Client-generated, so a user can never see this — but if it ever surfaces
+  // it must read as English, not as a leaked field name.
+  body('idempotencyKey')
+    .notEmpty()
+    .withMessage('This payment could not be identified. Please retry from the app.'),
   validate
 ], async (req, res) => {
   const { userId, amount, method, idempotencyKey } = req.body;
