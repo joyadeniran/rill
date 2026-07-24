@@ -1,3 +1,30 @@
+# Rill — Engineering Log
+
+Chronological record of work on Rill. Newest sections are appended at the bottom;
+this index is the fast path.
+
+## Index
+
+| # | Work | Outcome |
+|---|---|---|
+| — | Mobile crash investigation & hardening (2026-06-03) | Error boundary, API hardening, backend robustness — §1 below |
+| — | Production-readiness pass | Roles scaffold, invite gating, timestamptz migration, CORS/token auth |
+| #6 | Expo build never succeeded | Stray root `app.json`/`eas.json` was shadowing `mobile/` |
+| #7 | Blank release APK (hypothesis) | Removed unused `expo-updates` — **wrong diagnosis, see #8** |
+| #8 | Blank/crashing APK (**actual**) | Expo native modules were nested, not hoisted → autolinking missed them |
+| — | Production 503 outage | Render free Postgres deleted; Supabase direct host is IPv6-only |
+| — | Security | Supabase RLS enabled on all 6 tables, verified with a canary row |
+| #9 | Backend security hardening | Constant-time compare, required idempotency key, prompt-injection |
+| #10 | Validation error contract | `{error, fields}` — fixed "400 instead of field validation" |
+| #11 | Three-role model | `co` / `admin` / `lender` with enforced privilege matrix |
+| #12 | Defaulters & assignment | Defaulter list + assign-to-CO + `/today` scoping |
+| #13 | Photo capability | Field evidence end to end, mobile capture + console viewer |
+| #14 | Console overhaul | Role-aware admin/lender web console |
+
+Full specification: [spec.md](spec.md).
+
+---
+
 # Rill Mobile App — Crash Investigation & Hardening Log
 
 **Date:** 2026-06-03
@@ -516,3 +543,200 @@ expo-doctor: 18/18
 
 ### Still unproven
 The fix is verified at the autolinking/build-config layer but **not yet on a device** — that requires a new APK. New Architecture remains ON and was never implicated by the logs.
+
+
+---
+
+# Session: full-system build-out (2026-07-24)
+
+**Goal.** Make Rill fully functional end to end: all three user types correctly
+provisioned, defaulter oversight and CO assignment for Supplya admins, picture
+capability, correct field validation and error feedback everywhere, edge cases and
+cascades handled, spec written, everything tested and merged.
+
+## Method
+
+Each item shipped as its own PR: test written first (failing), implementation,
+full suite green, CI green, squash-merge to `main`. No item was marked done on a
+partial or unverified state.
+
+---
+
+## PR #9 — Backend security hardening
+
+Three completed-but-uncommitted fixes, landed first so later work built on a clean
+tree.
+
+- **CRIT-B26** `verifyPassword`'s legacy branch used `===`, which short-circuits on
+  the first differing byte and leaks prefix/length via response timing. Replaced with
+  `constantTimeStringEqual` (SHA-256 digest each side, then `timingSafeEqual` — the
+  digest sidesteps the equal-length-buffer requirement without weakening the compare).
+- **CRIT-B27** `idempotencyKey` was optional on `POST /api/payments`. SQL UNIQUE does
+  not treat multiple `NULL`s as conflicting, so an omitted key silently disabled
+  double-payment protection. Now required.
+- **CRIT-B28** AI routes concatenated officer-entered free text into the prompt.
+  Now `config.systemInstruction` + body labelled untrusted + length caps.
+
+Result: 60 tests passing.
+
+---
+
+## PR #10 — Validation error contract
+
+**Reported symptom:** "setting password returns 400 error instead of field validation."
+
+**Root cause:** `validate` responded with only
+`{ errors: [ ...express-validator objects... ] }`, but every client reads
+`data.error` — a single string. So a 400 rendered as the generic
+`Request failed (400)` with no indication of which field was wrong.
+
+**Fix**
+- `validate()` now returns `{ error, fields, errors }` (§9 of spec.md).
+- Every validator chain gained an actionable `.withMessage()`; added missing
+  phone-format and `lastName` validation.
+- **Ordering:** the invite gate moved *before* field validation, so an uninvited
+  caller cannot probe which fields exist or what the password policy is.
+- Both clients now throw a typed `ApiError` carrying `status` + `fields`.
+- The web client gained the request timeout, non-JSON-body guard and `NetworkError`
+  separation the mobile client already had — a cold-start HTML error page no longer
+  throws an unguarded `SyntaxError` inside a render path.
+
+10 new tests pinning the contract, including the exact reported password case.
+Result: 70 tests.
+
+---
+
+## PR #11 — Three-role model
+
+Rill was designed for three users but only `co` and `admin` existed in code.
+
+- Added **`lender`** (README's "Lender & Admin Dashboards"; the audience for the
+  existing risk-briefing endpoint).
+- `requireRole` accepts multiple roles; 403 carries a human message.
+- **Closed a real hole:** `POST /api/users|payments|audits|escalations` previously
+  accepted *any* authenticated caller. Now `co` + `admin` only.
+- `officers.active`. Deactivated officers are refused at login — checked **after**
+  password verification, so the route cannot enumerate accounts.
+- `GET/POST/PATCH /api/officers` (admin only). POST refuses `role: 'admin'` — admin
+  authority comes only from a real Supplya account, so Rill can never mint its own.
+  PATCH refuses to touch admin accounts or the caller's own.
+- `POST /api/auth/change-password` — requires current password, rejects reuse,
+  returns field-level errors.
+
+25 new tests including privilege-escalation attempts. Result: 95 tests.
+
+---
+
+## PR #12 — Defaulters & assignment
+
+The explicitly requested admin capability.
+
+- `GET /api/defaulters` (admin, lender). **Never-paid is treated as maximally
+  overdue, not zero** — the naive `now - NULL` yields 0 and buries the worst cases at
+  the bottom of the list. Sorted worst-first.
+- `POST /api/users/:id/assign` (admin). Validates the target is a real, **active**
+  officer with `role === 'co'` — assigning to a lender or admin would create a
+  merchant nobody collects from. `null` clears back to the shared pool.
+- `/api/today` is assignment-aware: a CO sees merchants assigned to them **plus any
+  unassigned**, never another CO's. Two officers must not work the same merchant;
+  keeping unassigned merchants visible means none is ever invisible to the field.
+
+18 new tests. Result: 113 tests.
+
+---
+
+## PR #13 — Photo capability
+
+- `photos` table; `POST /api/photos`, `GET /api/photos/:id`,
+  `GET /api/users/:id/photos`.
+- Base64 in-row is a deliberate MVP tradeoff (no object store), which is why the
+  2MB cap and MIME allowlist are load-bearing.
+- `parseImageDataUrl` returns `{error}` rather than throwing → malformed upload is a
+  400, never an unhandled exception. It rejects **non-strict base64 before decoding**,
+  because `Buffer.from` silently *drops* invalid characters and would let a corrupt
+  payload through as a "valid" image.
+- The photo route gets its own 4MB parser and is skipped by the global one, so every
+  other route keeps the 100kb default DoS surface.
+- Listing returns metadata only — 20 photos would otherwise be tens of MB to draw a
+  thumbnail row.
+- 413 / malformed JSON now return real messages instead of a 500 that looks like a crash.
+- **`DELETE /api/users/:id`** — cascades across six tables in one transaction. With no
+  DB foreign keys, orphans would otherwise survive and keep appearing in aggregates.
+- Mobile: `expo-image-picker` as a **direct dependency** (applying the #8 lesson),
+  covered by the autolinking guard. Compresses to quality 0.5 and **strips EXIF** —
+  avoids shipping GPS of a merchant's premises. Cancel returns no message at all, so
+  it renders as nothing rather than an error.
+
+18 new tests. Result: 131 backend + 15 mobile.
+
+---
+
+## PR #14 — Role-aware console
+
+Rebuilt the web surface from an admin-only disbursement screen into a console serving
+both non-field roles.
+
+- Admin: Portfolio / Defaulters / Officers / Escalations. Lender: same minus Officers,
+  every mutating control removed. The lender's officer list is **never fetched** — a
+  403 mid-`Promise.all` would blank the whole console.
+- Defaulters view with one-click assign; the dropdown offers only *active* COs and
+  explains what to do when there are none.
+- Photo viewer: auth-gated photos can't be a bare `<img src>`, so they're fetched with
+  the bearer token as object URLs and **revoked on unmount** (an un-revoked object URL
+  pins the blob in memory).
+- Shared `ui.tsx` so loading / empty / error / success are expressed identically
+  everywhere; `Field` renders the server's per-field message against the offending input.
+- Buttons disable while in flight — a double-submitted disbursement is real money.
+- Delete is behind an explicit confirm; a 401 during load signs out rather than
+  stranding an empty console.
+- **Also fixed:** vite had no `/api` proxy, so in dev the console (3000) could not
+  reach the API (3001) at all. Production was unaffected (Express serves the bundle on
+  one origin), which is why it went unnoticed.
+
+**Verified against a live server with seeded data** (5 merchants, 4 disbursements, a
+payment, 2 escalations): lender sees read-only views with no Officers tab; admin
+assigned a defaulter to a CO and the assignment persisted to the DB; an invalid
+password rendered "Password must be at least 6 characters" inline against the field —
+the originally reported bug, confirmed fixed in the real UI.
+
+---
+
+## Infrastructure resolved this session
+
+- **Production 503 outage.** Two stacked failures, both proven from Render logs
+  rather than inferred: the Render free Postgres had been **deleted**
+  (`ENOTFOUND dpg-…`), and the Supabase *direct* host is **IPv6-only** while Render is
+  IPv4-only (`ENETUNREACH 2600:1f1c:…`). Fixed by pointing `DATABASE_URL` at the
+  Supabase **IPv4 session pooler**. API went 503 → 401 → fully functional.
+- **RLS.** Enabled on all six tables. Verified with a canary row that the public anon
+  key can neither read (`[]` against a row that exists) nor write
+  (`42501 violates row-level security policy`), while the API is unaffected.
+- **Invite code** simplified to `rill-co-2026` at the user's request.
+
+---
+
+## Corrections made to earlier conclusions
+
+Recorded because both were shipped with confidence and turned out wrong.
+
+1. **PR #7 was a wrong diagnosis.** The blank APK was attributed to `expo-updates`
+   mediating bundle loading. Removing it was harmless cleanup but was *not* the fix.
+   The real cause (PR #8) was only found once device `logcat` was captured:
+   `Cannot find native module 'ExpoAsset'` → `"main" has not been registered`. Lesson:
+   a plausible mechanism is not evidence; get the device log before shipping a fix.
+2. **Two "verification" tests during the 503 investigation were non-discriminating.**
+   DNS resolution and a TCP probe both "succeeded" against a *fabricated* hostname —
+   Render wildcards both. Controls caught it. Lesson: a test that cannot fail proves
+   nothing.
+
+---
+
+## Remaining / planned
+
+- [ ] Mobile UX pass: field-level validation rendering, photo capture wired into the
+      audit and payment flows, loading/disabled states, offline feedback.
+- [ ] Edge-case hardening sweep + repeated full-suite runs.
+- [ ] Rotate the Supabase DB password and the invite code (both exposed in a chat
+      transcript during the outage debugging).
+- [ ] Migrate photos to object storage before volume becomes material (spec.md §7).
+- [ ] Groups / group enforcement (schema field exists, no logic).
