@@ -101,10 +101,16 @@ describe('Rill API Integration Tests', () => {
   });
 
   test('Edge Case: Register with invalid email should fail', async () => {
+    // Invite code included so the request reaches field validation — the
+    // invite gate deliberately runs first, so an uninvited caller cannot probe
+    // the validation rules.
     const res = await request(app)
       .post('/api/auth/register')
-      .send({ email: 'invalid', password: '123' });
+      .send({ email: 'invalid', password: '123', ...INVITE });
     expect(res.status).toBe(400);
+    // The failure must name the offending fields, not just be a bare 400.
+    expect(res.body.fields.email).toBeDefined();
+    expect(res.body.fields.password).toBeDefined();
   });
 
   test('Edge Case: Login with missing fields should return 400, not 500', async () => {

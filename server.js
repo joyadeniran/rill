@@ -426,29 +426,68 @@ const checkAi = (req, res, next) => {
   next();
 };
 
+// Validation failures must be RENDERABLE by clients. Every client reads
+// `data.error` (a single string), so responding with only express-validator's
+// `errors` array produced a useless generic "Request failed (400)" with no
+// indication of which field was wrong.
+//
+// Response contract for every validated endpoint:
+//   error:  human-readable summary (always present — what clients display)
+//   fields: { fieldName: message }  (per-field, for inline form display)
+//   errors: the raw express-validator array (kept for backwards compatibility)
 const validate = (req, res, next) => {
-  const errors = validationResult(req);
-  if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
-  next();
+  const result = validationResult(req);
+  if (result.isEmpty()) return next();
+
+  const raw = result.array();
+  const fields = {};
+  for (const e of raw) {
+    // express-validator v7 uses `path`; older versions used `param`.
+    const key = e.path || e.param || '_';
+    // Keep the FIRST message per field: validators are declared in
+    // most-fundamental-first order (exists -> type -> range), so the first
+    // failure is the most actionable one to show the user.
+    if (!fields[key]) fields[key] = e.msg;
+  }
+
+  const names = Object.keys(fields);
+  const error =
+    names.length === 1
+      ? fields[names[0]]
+      : `Please correct the following: ${names.join(', ')}`;
+
+  return res.status(400).json({ error, fields, errors: raw });
 };
 
 // --- ENDPOINTS ---
 app.get('/health', (req, res) => res.json({ status: 'ok', db: isPostgres ? 'postgres' : 'sqlite' }));
 
-app.post('/api/auth/register', authRateLimit, [
-  body('email').isEmail(),
-  body('password').isLength({ min: 6 }),
-  body('firstName').notEmpty(),
+// Registration is invite-gated in production (REGISTRATION_INVITE_CODE set via
+// render.yaml). Without the gate, anyone who finds the URL could mint a CO
+// account and read/write the merchant book. When the env is unset (local dev),
+// registration stays open.
+//
+// This runs BEFORE field validation deliberately: an uninvited caller must not
+// be able to probe the API's validation rules (which fields exist, what the
+// password policy is) by submitting malformed payloads.
+const requireInviteCode = (req, res, next) => {
+  const inviteGate = process.env.REGISTRATION_INVITE_CODE;
+  if (inviteGate && req.body?.inviteCode !== inviteGate) {
+    return res.status(403).json({
+      error: 'A valid invite code is required to register',
+      fields: { inviteCode: 'This invite code is not valid' }
+    });
+  }
+  next();
+};
+
+app.post('/api/auth/register', authRateLimit, requireInviteCode, [
+  body('email').isEmail().withMessage('Enter a valid email address'),
+  body('password').isLength({ min: 6 }).withMessage('Password must be at least 6 characters'),
+  body('firstName').trim().notEmpty().withMessage('First name is required'),
+  body('lastName').trim().notEmpty().withMessage('Last name is required'),
   validate
 ], async (req, res) => {
-  // Registration is invite-gated in production (REGISTRATION_INVITE_CODE set
-  // via render.yaml). Without the gate, anyone who finds the URL could mint a
-  // CO account and read/write the merchant book. When the env is unset (local
-  // dev), registration stays open.
-  const inviteGate = process.env.REGISTRATION_INVITE_CODE;
-  if (inviteGate && req.body.inviteCode !== inviteGate) {
-    return res.status(403).json({ error: 'A valid invite code is required to register' });
-  }
   const { email, password, firstName, lastName } = req.body;
   const id = randomUUID();
   try {
@@ -465,8 +504,8 @@ app.post('/api/auth/register', authRateLimit, [
 });
 
 app.post('/api/auth/login', authRateLimit, [
-  body('email').isEmail(),
-  body('password').notEmpty(),
+  body('email').isEmail().withMessage('Enter a valid email address'),
+  body('password').notEmpty().withMessage('Password is required'),
   validate
 ], async (req, res) => {
   const { email, password } = req.body;
@@ -491,8 +530,8 @@ const SUPPLYA_API_BASE = () =>
   process.env.SUPPLYA_API_BASE || 'https://supplya-backend-3t2x.onrender.com/api/v1';
 
 app.post('/api/auth/admin-login', authRateLimit, [
-  body('email').isEmail(),
-  body('password').notEmpty(),
+  body('email').isEmail().withMessage('Enter a valid email address'),
+  body('password').notEmpty().withMessage('Password is required'),
   validate
 ], async (req, res) => {
   const { email, password } = req.body;
@@ -579,8 +618,9 @@ app.get('/api/users/:id/history', requireAuth, async (req, res) => {
 });
 
 app.post('/api/users', requireAuth, [
-  body('name').notEmpty(),
-  body('location').notEmpty(),
+  body('name').trim().notEmpty().withMessage('Merchant name is required'),
+  body('location').trim().notEmpty().withMessage('Location is required'),
+  body('phone').optional({ values: 'falsy' }).trim().isLength({ min: 7, max: 20 }).withMessage('Enter a valid phone number'),
   validate
 ], async (req, res) => {
   const { name, phone, location, groupId } = req.body;
@@ -593,9 +633,9 @@ app.post('/api/users', requireAuth, [
 // Admin-only: put money on a merchant's book. This is the only path that
 // increases total_owed/balance and the only path to status 'active'.
 app.post('/api/disbursements', requireAuth, requireRole('admin'), [
-  body('userId').notEmpty(),
-  body('amount').isInt({ gt: 0 }),
-  body('dailyInstallment').isInt({ gt: 0 }),
+  body('userId').trim().notEmpty().withMessage('Select a merchant'),
+  body('amount').isInt({ gt: 0 }).withMessage('Amount must be a whole number greater than 0'),
+  body('dailyInstallment').isInt({ gt: 0 }).withMessage('Daily installment must be a whole number greater than 0'),
   validate
 ], async (req, res) => {
   const { userId, amount, dailyInstallment } = req.body;
@@ -637,7 +677,7 @@ app.get('/api/escalations', requireAuth, requireRole('admin'), async (req, res) 
 
 // Admin-only: activate/deactivate a merchant.
 app.patch('/api/users/:id/status', requireAuth, requireRole('admin'), [
-  body('status').isIn(['active', 'deactivated']),
+  body('status').isIn(['active', 'deactivated']).withMessage("Status must be 'active' or 'deactivated'"),
   validate
 ], async (req, res) => {
   const { rows } = await query('SELECT id FROM users WHERE id = ?', [req.params.id]);
@@ -654,9 +694,9 @@ app.patch('/api/users/:id/status', requireAuth, requireRole('admin'), [
 // (mobile/src/services/api.ts, mobile/src/components/FieldOfficerApp.tsx),
 // so enforcing it server-side is a safe tightening, not a breaking change.
 app.post('/api/payments', requireAuth, [
-  body('userId').notEmpty(),
-  body('amount').isInt({ gt: 0 }),
-  body('method').optional().isIn(['cash', 'pos', 'transfer']),
+  body('userId').trim().notEmpty().withMessage('Select a merchant'),
+  body('amount').isInt({ gt: 0 }).withMessage('Amount must be a whole number greater than 0'),
+  body('method').optional().isIn(['cash', 'pos', 'transfer']).withMessage("Method must be 'cash', 'pos' or 'transfer'"),
   body('idempotencyKey').notEmpty().withMessage('idempotencyKey is required'),
   validate
 ], async (req, res) => {
@@ -704,7 +744,7 @@ app.post('/api/payments', requireAuth, [
   res.json({ success: true, id });
 });
 
-app.post('/api/audits', requireAuth, [body('userId').notEmpty(), validate], async (req, res) => {
+app.post('/api/audits', requireAuth, [body('userId').trim().notEmpty().withMessage('Select a merchant'), validate], async (req, res) => {
   const { userId, mood, stockLevel, traffic, notes } = req.body;
   const id = randomUUID();
   await query('INSERT INTO audits (id, user_id, mood, stock_level, traffic, notes) VALUES (?, ?, ?, ?, ?, ?)',
@@ -712,7 +752,7 @@ app.post('/api/audits', requireAuth, [body('userId').notEmpty(), validate], asyn
   res.json({ success: true, id });
 });
 
-app.post('/api/escalations', requireAuth, [body('userId').notEmpty(), body('reason').notEmpty(), validate], async (req, res) => {
+app.post('/api/escalations', requireAuth, [body('userId').trim().notEmpty().withMessage('Select a merchant'), body('reason').trim().notEmpty().withMessage('An escalation reason is required'), validate], async (req, res) => {
   const { userId, reason } = req.body;
   const id = randomUUID();
   await query('INSERT INTO escalations (id, user_id, reason) VALUES (?, ?, ?)', [id, userId, reason]);
@@ -765,8 +805,8 @@ Output JSON with prioritizedIds and reasoning.`;
 // treats it with more authority than inline conversational content) and
 // the untrusted text is length-capped and clearly delimited.
 app.post('/api/rebuttal', requireAuth, checkAi, [
-  body('merchantName').trim().isLength({ max: 200 }),
-  body('excuse').trim().isLength({ max: 2000 }),
+  body('merchantName').trim().isLength({ max: 200 }).withMessage('Merchant name is too long (max 200 characters)'),
+  body('excuse').trim().notEmpty().withMessage('Describe what the merchant said').isLength({ max: 2000 }).withMessage('Excuse is too long (max 2000 characters)'),
   validate
 ], async (req, res) => {
     const { merchantName, excuse } = req.body;
