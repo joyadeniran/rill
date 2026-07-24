@@ -195,12 +195,24 @@ const requireAuth = (req, res, next) => {
   next();
 };
 
+// Rill's three roles. See spec.md §3 for the full privilege matrix.
+//   co     — field Collection Officer (mobile). Works his assigned book.
+//   admin  — Supplya admin (web). Money, lifecycle, assignment, officers.
+//   lender — capital provider (web). Read-only oversight.
+const ROLES = ['co', 'admin', 'lender'];
+
 // Role check on top of requireAuth. The role lives in the signed token payload,
 // so it cannot be forged client-side. Admin tokens are minted only via the
-// Supplya admin-login proxy (or a future admin-provisioning path) — Rill has no
-// self-service route to an admin role.
-const requireRole = (role) => (req, res, next) => {
-  if (req.officer?.role !== role) return res.status(403).json({ error: 'Forbidden' });
+// Supplya admin-login proxy — Rill has no self-service route to an admin role,
+// and POST /api/officers explicitly refuses to create one.
+//
+// Accepts one or more roles: requireRole('admin', 'lender').
+const requireRole = (...roles) => (req, res, next) => {
+  if (!roles.includes(req.officer?.role)) {
+    return res.status(403).json({
+      error: 'You do not have permission to perform this action'
+    });
+  }
   next();
 };
 
@@ -242,6 +254,7 @@ const initDb = async () => {
       first_name TEXT,
       last_name TEXT,
       role TEXT DEFAULT 'co',
+      active INTEGER DEFAULT 1,
       created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
     );
 
@@ -311,6 +324,7 @@ const initDb = async () => {
 async function migrateSchemaAdditions() {
   const additions = [
     ['officers', 'role', "TEXT DEFAULT 'co'"],
+    ['officers', 'active', 'INTEGER DEFAULT 1'],
     ['payments', 'idempotency_key', 'TEXT']
   ];
   for (const [table, column, type] of additions) {
@@ -503,19 +517,34 @@ app.post('/api/auth/register', authRateLimit, requireInviteCode, [
   }
 });
 
+// `active` is INTEGER in SQLite (1/0) and may come back as a boolean from
+// Postgres depending on driver coercion; treat only an explicit falsy 0/false
+// as deactivated so pre-migration rows (NULL) keep working.
+function isDeactivated(officer) {
+  return officer.active === 0 || officer.active === false;
+}
+
 app.post('/api/auth/login', authRateLimit, [
   body('email').isEmail().withMessage('Enter a valid email address'),
   body('password').notEmpty().withMessage('Password is required'),
   validate
 ], async (req, res) => {
   const { email, password } = req.body;
-  const { rows } = await query('SELECT id, email, password, first_name as "firstName", last_name as "lastName", role FROM officers WHERE email = ?', [email]);
+  const { rows } = await query('SELECT id, email, password, first_name as "firstName", last_name as "lastName", role, active FROM officers WHERE email = ?', [email]);
   const officer = rows[0];
   if (officer && verifyPassword(password, officer.password)) {
+    // Deactivated officers keep their credentials but lose access. Checked
+    // AFTER the password verify so this route cannot be used to enumerate
+    // which accounts exist or are disabled.
+    if (isDeactivated(officer)) {
+      return res.status(403).json({
+        error: 'This account has been deactivated. Contact your administrator.'
+      });
+    }
     if (!isHashedPassword(officer.password)) {
       await query('UPDATE officers SET password = ? WHERE id = ?', [hashPassword(password), officer.id]);
     }
-    const { password: _, ...safeOfficer } = officer;
+    const { password: _, active: __, ...safeOfficer } = officer;
     res.json({ officer: safeOfficer, token: createAuthToken(safeOfficer) });
   } else {
     res.status(401).json({ error: 'Invalid credentials' });
@@ -617,7 +646,7 @@ app.get('/api/users/:id/history', requireAuth, async (req, res) => {
   res.json({ payments, audits, disbursements });
 });
 
-app.post('/api/users', requireAuth, [
+app.post('/api/users', requireAuth, requireRole('co', 'admin'), [
   body('name').trim().notEmpty().withMessage('Merchant name is required'),
   body('location').trim().notEmpty().withMessage('Location is required'),
   body('phone').optional({ values: 'falsy' }).trim().isLength({ min: 7, max: 20 }).withMessage('Enter a valid phone number'),
@@ -653,8 +682,110 @@ app.post('/api/disbursements', requireAuth, requireRole('admin'), [
   res.json({ success: true, id });
 });
 
-// Admin-only: full user list, including deactivated (unlike /api/today).
-app.get('/api/users', requireAuth, requireRole('admin'), async (req, res) => {
+// --- OFFICER MANAGEMENT (admin only) ---
+// Admins provision the people who use Rill: field COs and lender accounts.
+// Password material never leaves the server on any of these routes.
+
+app.get('/api/officers', requireAuth, requireRole('admin'), async (req, res) => {
+  const { rows } = await query(`
+    SELECT id, email, first_name as "firstName", last_name as "lastName",
+           role, active, created_at as "createdAt"
+    FROM officers ORDER BY role, first_name
+  `);
+  res.json(rows.map((o) => ({ ...o, active: !isDeactivated(o) })));
+});
+
+app.post('/api/officers', requireAuth, requireRole('admin'), [
+  body('email').isEmail().withMessage('Enter a valid email address'),
+  body('password').isLength({ min: 6 }).withMessage('Password must be at least 6 characters'),
+  body('firstName').trim().notEmpty().withMessage('First name is required'),
+  body('lastName').trim().notEmpty().withMessage('Last name is required'),
+  // Deliberately excludes 'admin': admin authority comes only from a real
+  // Supplya admin account via the admin-login proxy. Rill must never be able
+  // to mint its own admin.
+  body('role').isIn(['co', 'lender']).withMessage("Role must be 'co' or 'lender'"),
+  validate
+], async (req, res) => {
+  const { email, password, firstName, lastName, role } = req.body;
+  const { rows: existing } = await query('SELECT id FROM officers WHERE email = ?', [email]);
+  if (existing.length > 0) {
+    return res.status(400).json({
+      error: 'An officer with that email already exists',
+      fields: { email: 'This email is already registered' }
+    });
+  }
+  const id = randomUUID();
+  await query(
+    'INSERT INTO officers (id, email, password, first_name, last_name, role, active) VALUES (?, ?, ?, ?, ?, ?, ?)',
+    [id, email, hashPassword(password), firstName, lastName, role, 1]
+  );
+  res.json({ officer: { id, email, firstName, lastName, role, active: true } });
+});
+
+app.patch('/api/officers/:id', requireAuth, requireRole('admin'), [
+  body('active').optional().isBoolean().withMessage('Active must be true or false'),
+  body('role').optional().isIn(['co', 'lender']).withMessage("Role must be 'co' or 'lender'"),
+  validate
+], async (req, res) => {
+  const { rows } = await query('SELECT id, role FROM officers WHERE id = ?', [req.params.id]);
+  const target = rows[0];
+  if (!target) return res.status(404).json({ error: 'Officer not found' });
+
+  // An admin must not be able to demote or lock out an admin account through
+  // this route — admin authority is owned by Supplya, not Rill.
+  if (target.role === 'admin') {
+    return res.status(403).json({ error: 'Admin accounts are managed in Supplya, not Rill' });
+  }
+  if (req.params.id === req.officer.sub) {
+    return res.status(400).json({ error: 'You cannot modify your own account here' });
+  }
+
+  const { active, role } = req.body;
+  if (active === undefined && role === undefined) {
+    return res.status(400).json({
+      error: 'Nothing to update',
+      fields: { active: 'Provide active and/or role' }
+    });
+  }
+  if (active !== undefined) {
+    await query('UPDATE officers SET active = ? WHERE id = ?', [active ? 1 : 0, req.params.id]);
+  }
+  if (role !== undefined) {
+    await query('UPDATE officers SET role = ? WHERE id = ?', [role, req.params.id]);
+  }
+  res.json({ success: true });
+});
+
+// Any authenticated user may change their OWN password. Requires the current
+// password so a stolen, unattended session cannot lock the real owner out.
+app.post('/api/auth/change-password', requireAuth, [
+  body('currentPassword').notEmpty().withMessage('Enter your current password'),
+  body('newPassword').isLength({ min: 6 }).withMessage('New password must be at least 6 characters'),
+  validate
+], async (req, res) => {
+  const { currentPassword, newPassword } = req.body;
+  const { rows } = await query('SELECT id, password FROM officers WHERE id = ?', [req.officer.sub]);
+  const officer = rows[0];
+  if (!officer) return res.status(404).json({ error: 'Account not found' });
+
+  if (!verifyPassword(currentPassword, officer.password)) {
+    return res.status(400).json({
+      error: 'Your current password is incorrect',
+      fields: { currentPassword: 'This is not your current password' }
+    });
+  }
+  if (verifyPassword(newPassword, officer.password)) {
+    return res.status(400).json({
+      error: 'Your new password must be different from your current one',
+      fields: { newPassword: 'Choose a password you have not used before' }
+    });
+  }
+  await query('UPDATE officers SET password = ? WHERE id = ?', [hashPassword(newPassword), officer.id]);
+  res.json({ success: true });
+});
+
+// Admin/lender: full user list, including deactivated (unlike /api/today).
+app.get('/api/users', requireAuth, requireRole('admin', 'lender'), async (req, res) => {
   const { rows } = await query(`
     SELECT
       id, name, phone, location, group_id as "groupId",
@@ -666,7 +797,7 @@ app.get('/api/users', requireAuth, requireRole('admin'), async (req, res) => {
 });
 
 // Admin-only: escalation feed ("admin visibility" per RILL_SPEC §8).
-app.get('/api/escalations', requireAuth, requireRole('admin'), async (req, res) => {
+app.get('/api/escalations', requireAuth, requireRole('admin', 'lender'), async (req, res) => {
   const { rows } = await query(`
     SELECT e.id, e.user_id as "userId", u.name as "userName", e.reason, e.timestamp
     FROM escalations e LEFT JOIN users u ON u.id = e.user_id
@@ -693,7 +824,7 @@ app.patch('/api/users/:id/status', requireAuth, requireRole('admin'), [
 // client already types idempotencyKey as required and always sends one
 // (mobile/src/services/api.ts, mobile/src/components/FieldOfficerApp.tsx),
 // so enforcing it server-side is a safe tightening, not a breaking change.
-app.post('/api/payments', requireAuth, [
+app.post('/api/payments', requireAuth, requireRole('co', 'admin'), [
   body('userId').trim().notEmpty().withMessage('Select a merchant'),
   body('amount').isInt({ gt: 0 }).withMessage('Amount must be a whole number greater than 0'),
   body('method').optional().isIn(['cash', 'pos', 'transfer']).withMessage("Method must be 'cash', 'pos' or 'transfer'"),
@@ -744,7 +875,7 @@ app.post('/api/payments', requireAuth, [
   res.json({ success: true, id });
 });
 
-app.post('/api/audits', requireAuth, [body('userId').trim().notEmpty().withMessage('Select a merchant'), validate], async (req, res) => {
+app.post('/api/audits', requireAuth, requireRole('co', 'admin'), [body('userId').trim().notEmpty().withMessage('Select a merchant'), validate], async (req, res) => {
   const { userId, mood, stockLevel, traffic, notes } = req.body;
   const id = randomUUID();
   await query('INSERT INTO audits (id, user_id, mood, stock_level, traffic, notes) VALUES (?, ?, ?, ?, ?, ?)',
@@ -752,7 +883,7 @@ app.post('/api/audits', requireAuth, [body('userId').trim().notEmpty().withMessa
   res.json({ success: true, id });
 });
 
-app.post('/api/escalations', requireAuth, [body('userId').trim().notEmpty().withMessage('Select a merchant'), body('reason').trim().notEmpty().withMessage('An escalation reason is required'), validate], async (req, res) => {
+app.post('/api/escalations', requireAuth, requireRole('co', 'admin'), [body('userId').trim().notEmpty().withMessage('Select a merchant'), body('reason').trim().notEmpty().withMessage('An escalation reason is required'), validate], async (req, res) => {
   const { userId, reason } = req.body;
   const id = randomUUID();
   await query('INSERT INTO escalations (id, user_id, reason) VALUES (?, ?, ?)', [id, userId, reason]);
@@ -852,3 +983,7 @@ export default app;
 // and constant-time behavior aren't practically verifiable through the HTTP
 // layer alone — see server.test.js).
 export { hashPassword, isHashedPassword, verifyPassword, constantTimeStringEqual };
+// Lets the role tests mint a token for an arbitrary role without needing a
+// real admin/lender login flow (admin tokens come from the Supplya proxy,
+// which cannot run in tests).
+export const signTokenForTest = signToken;
